@@ -24,11 +24,7 @@
 
 #include "adb.h"
 
-#if defined(_WIN32)
-#define ETXTBSY EBUSY
-#endif
-
-// Use the linux asm-generic values for errno (which are used on all android archs but mips).
+// Use the linux asm-generic values for errno (which are used on all android architectures).
 #define ERRNO_VALUES()             \
     ERRNO_VALUE(EACCES, 13);       \
     ERRNO_VALUE(EEXIST, 17);       \
@@ -52,7 +48,7 @@
     ERRNO_VALUE(ETXTBSY, 26)
 
 // Make sure these values are actually correct.
-#if defined(__linux__) && !defined(__mips__)
+#if defined(__linux__)
 #define ERRNO_VALUE(error_name, wire_value) static_assert((error_name) == (wire_value), "")
 ERRNO_VALUES();
 #undef ERRNO_VALUE

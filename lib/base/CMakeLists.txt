@@ -1,12 +1,13 @@
 cmake_minimum_required(VERSION 3.5.1)
 project(libbase)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 20)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CMAKE_SOURCE_DIR}/lib/base/include)
 
 set (SOURCES_BASE
+        parsebool.cpp
         file.cpp
         logging.cpp
         parsenetaddress.cpp

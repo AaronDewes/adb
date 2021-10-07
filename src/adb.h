@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef __ADB_H
-#define __ADB_H
+#pragma once
 
 #include <limits.h>
 #include <stdint.h>
@@ -26,13 +25,13 @@
 #include <android-base/macros.h>
 
 #include "adb_trace.h"
-#include "fdevent.h"
+#include "fdevent/fdevent.h"
 #include "socket.h"
 #include "types.h"
-#include "usb.h"
 
 constexpr size_t MAX_PAYLOAD_V1 = 4 * 1024;
 constexpr size_t MAX_PAYLOAD = 1024 * 1024;
+constexpr size_t MAX_FRAMEWORK_PAYLOAD = 64 * 1024;
 
 constexpr size_t LINUX_MAX_SOCKET_SIZE = 4194304;
 
@@ -43,6 +42,7 @@ constexpr size_t LINUX_MAX_SOCKET_SIZE = 4194304;
 #define A_CLSE 0x45534c43
 #define A_WRTE 0x45545257
 #define A_AUTH 0x48545541
+#define A_STLS 0x534C5453
 
 // ADB protocol version.
 // Version revision:
@@ -52,6 +52,10 @@ constexpr size_t LINUX_MAX_SOCKET_SIZE = 4194304;
 #define A_VERSION_SKIP_CHECKSUM 0x01000001
 #define A_VERSION 0x01000001
 
+// Stream-based TLS protocol version
+#define A_STLS_VERSION_MIN 0x01000000
+#define A_STLS_VERSION 0x01000000
+
 // Used for help/version information.
 #define ADB_VERSION_MAJOR 1
 #define ADB_VERSION_MINOR 0
@@ -59,7 +63,7 @@ constexpr size_t LINUX_MAX_SOCKET_SIZE = 4194304;
 std::string adb_version();
 
 // Increment this when we want to force users to start a new adb server.
-#define ADB_SERVER_VERSION 40
+#define ADB_SERVER_VERSION 41
 
 using TransportId = uint64_t;
 class atransport;
@@ -100,6 +104,7 @@ enum ConnectionState {
     kCsAuthorizing,     // Authorizing with keys from ADB_VENDOR_KEYS.
     kCsUnauthorized,    // ADB_VENDOR_KEYS exhausted, fell back to user prompt.
     kCsNoPerm,          // Insufficient permissions to communicate with the device.
+    kCsDetached,        // USB device that's detached from the adb server.
     kCsOffline,
 
     kCsBootloader,
@@ -107,7 +112,10 @@ enum ConnectionState {
     kCsHost,
     kCsRecovery,
     kCsSideload,
+    kCsRescue,
 };
+
+std::string to_string(ConnectionState state);
 
 inline bool ConnectionStateIsOnline(ConnectionState state) {
     switch (state) {
@@ -116,6 +124,7 @@ inline bool ConnectionStateIsOnline(ConnectionState state) {
         case kCsHost:
         case kCsRecovery:
         case kCsSideload:
+        case kCsRescue:
             return true;
         default:
             return false;
@@ -124,9 +133,6 @@ inline bool ConnectionStateIsOnline(ConnectionState state) {
 
 void print_packet(const char* label, apacket* p);
 
-void fatal(const char* fmt, ...) __attribute__((noreturn, format(__printf__, 1, 2)));
-void fatal_errno(const char* fmt, ...) __attribute__((noreturn, format(__printf__, 1, 2)));
-
 void handle_packet(apacket* p, atransport* t);
 
 int launch_server(const std::string& socket_spec);
@@ -134,7 +140,6 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, int ack_reply
 
 /* initialize a transport object's func pointers and state */
 int init_socket_transport(atransport* t, unique_fd s, int port, int local);
-void init_usb_transport(atransport* t, usb_handle* usb);
 
 std::string getEmulatorSerialString(int console_port);
 #if ADB_HOST
@@ -142,19 +147,29 @@ atransport* find_emulator_transport_by_adb_port(int adb_port);
 atransport* find_emulator_transport_by_console_port(int console_port);
 #endif
 
-int service_to_fd(const char* name, atransport* transport);
+unique_fd service_to_fd(std::string_view name, atransport* transport);
 #if !ADB_HOST
-unique_fd daemon_service_to_fd(const char* name, atransport* transport);
+unique_fd daemon_service_to_fd(std::string_view name, atransport* transport);
 #endif
 
 #if ADB_HOST
-asocket* host_service_to_socket(const char* name, const char* serial, TransportId transport_id);
+asocket* host_service_to_socket(std::string_view name, std::string_view serial,
+                                TransportId transport_id);
+#endif
+
+#if !ADB_HOST
+asocket* daemon_service_to_socket(std::string_view name);
+#endif
+
+#if !ADB_HOST
+unique_fd execute_abb_command(std::string_view command);
 #endif
 
 #if !ADB_HOST
 int init_jdwp(void);
 asocket* create_jdwp_service_socket();
 asocket* create_jdwp_tracker_service_socket();
+asocket* create_app_tracker_service_socket();
 unique_fd create_jdwp_connection_fd(int jdwp_pid);
 #endif
 
@@ -176,14 +191,7 @@ void put_apacket(apacket* p);
     } while (0)
 #endif
 
-#if ADB_HOST_ON_TARGET
-/* adb and adbd are coexisting on the target, so use 5038 for adb
- * to avoid conflicting with adbd's usage of 5037
- */
-#define DEFAULT_ADB_PORT 5038
-#else
 #define DEFAULT_ADB_PORT 5037
-#endif
 
 #define DEFAULT_ADB_LOCAL_TRANSPORT_PORT 5555
 
@@ -191,15 +199,16 @@ void put_apacket(apacket* p);
 #define ADB_SUBCLASS 0x42
 #define ADB_PROTOCOL 0x1
 
-void local_init(int port);
+void local_init(const std::string& addr);
 bool local_connect(int port);
 int local_connect_arbitrary_ports(int console_port, int adb_port, std::string* error);
-
-ConnectionState connection_state(atransport* t);
 
 extern const char* adb_device_banner;
 
 #define CHUNK_SIZE (64 * 1024)
+
+// Argument delimeter for adb abb command.
+#define ABB_ARG_DELIMETER ('\0')
 
 #if !ADB_HOST
 #define USB_FFS_ADB_PATH "/dev/usb-ffs/adb/"
@@ -210,16 +219,25 @@ extern const char* adb_device_banner;
 #define USB_FFS_ADB_IN USB_FFS_ADB_EP(ep2)
 #endif
 
-bool handle_host_request(const char* service, TransportType type, const char* serial,
-                         TransportId transport_id, int reply_fd, asocket* s);
+enum class HostRequestResult {
+    Handled,
+    SwitchedTransport,
+    Unhandled,
+};
+
+HostRequestResult handle_host_request(std::string_view service, TransportType type,
+                                      const char* serial, TransportId transport_id, int reply_fd,
+                                      asocket* s);
 
 void handle_online(atransport* t);
 void handle_offline(atransport* t);
 
 void send_connect(atransport* t);
+void send_tls_request(atransport* t);
 
 void parse_banner(const std::string&, atransport* t);
 
+#if ADB_HOST
 // On startup, the adb server needs to wait until all of the connected devices are ready.
 // To do this, we need to know when the scan has identified all of the potential new transports, and
 // when each transport becomes ready.
@@ -233,5 +251,12 @@ void update_transport_status();
 
 // Wait until device scan has completed and every transport is ready, or a timeout elapses.
 void adb_wait_for_device_initialization();
+#endif  // ADB_HOST
 
+#if ADB_HOST
+// When ssh-forwarding to a remote adb server, kill-server is almost never what you actually want,
+// and unfortunately, many other tools issue it. This adds a knob to reject kill-servers.
+void adb_set_reject_kill_server(bool reject);
 #endif
+
+void usb_init();

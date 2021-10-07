@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2007 The Android Open Source Project
+ * Copyright (C) 2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,528 +18,758 @@
 
 #include "sysdeps.h"
 
-#include <dirent.h>
 #include <errno.h>
-#include <linux/usb/ch9.h>
-#include <linux/usb/functionfs.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <linux/usb/functionfs.h>
+#include <sys/eventfd.h>
+
 #include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
+#include <array>
+#include <future>
+#include <memory>
 #include <mutex>
-#include <thread>
+#include <optional>
+#include <vector>
+
+#include <asyncio/AsyncIO.h>
 
 #include <android-base/logging.h>
+#include <android-base/macros.h>
+#include <android-base/parsebool.h>
 #include <android-base/properties.h>
+#include <android-base/thread_annotations.h>
 
-#include "adb.h"
-#include "adbd/usb.h"
+#include "adb_unique_fd.h"
+#include "adb_utils.h"
+#include "daemon/property_monitor.h"
+#include "daemon/usb_ffs.h"
+#include "sysdeps/chrono.h"
+#include "transfer_id.h"
 #include "transport.h"
+#include "types.h"
 
-using namespace std::chrono_literals;
+using android::base::StringPrintf;
 
-#define MAX_PACKET_SIZE_FS 64
-#define MAX_PACKET_SIZE_HS 512
-#define MAX_PACKET_SIZE_SS 1024
+// Not all USB controllers support operations larger than 16k, so don't go above that.
+// Also, each submitted operation does an allocation in the kernel of that size, so we want to
+// minimize our queue depth while still maintaining a deep enough queue to keep the USB stack fed.
+static constexpr size_t kUsbReadQueueDepth = 8;
+static constexpr size_t kUsbReadSize = 4 * PAGE_SIZE;
 
-#define USB_FFS_BULK_SIZE 16384
+static constexpr size_t kUsbWriteQueueDepth = 8;
+static constexpr size_t kUsbWriteSize = 4 * PAGE_SIZE;
 
-// Number of buffers needed to fit MAX_PAYLOAD, with an extra for ZLPs.
-#define USB_FFS_NUM_BUFS ((4 * MAX_PAYLOAD / USB_FFS_BULK_SIZE) + 1)
-
-#define cpu_to_le16(x) htole16(x)
-#define cpu_to_le32(x) htole32(x)
-
-static unique_fd& dummy_fd = *new unique_fd();
-
-struct func_desc {
-    struct usb_interface_descriptor intf;
-    struct usb_endpoint_descriptor_no_audio source;
-    struct usb_endpoint_descriptor_no_audio sink;
-} __attribute__((packed));
-
-struct ss_func_desc {
-    struct usb_interface_descriptor intf;
-    struct usb_endpoint_descriptor_no_audio source;
-    struct usb_ss_ep_comp_descriptor source_comp;
-    struct usb_endpoint_descriptor_no_audio sink;
-    struct usb_ss_ep_comp_descriptor sink_comp;
-} __attribute__((packed));
-
-struct desc_v1 {
-    struct usb_functionfs_descs_head_v1 {
-        __le32 magic;
-        __le32 length;
-        __le32 fs_count;
-        __le32 hs_count;
-    } __attribute__((packed)) header;
-    struct func_desc fs_descs, hs_descs;
-} __attribute__((packed));
-
-struct desc_v2 {
-    struct usb_functionfs_descs_head_v2 header;
-    // The rest of the structure depends on the flags in the header.
-    __le32 fs_count;
-    __le32 hs_count;
-    __le32 ss_count;
-    __le32 os_count;
-    struct func_desc fs_descs, hs_descs;
-    struct ss_func_desc ss_descs;
-    struct usb_os_desc_header os_header;
-    struct usb_ext_compat_desc os_desc;
-} __attribute__((packed));
-
-static struct func_desc fs_descriptors = {
-    .intf = {
-        .bLength = sizeof(fs_descriptors.intf),
-        .bDescriptorType = USB_DT_INTERFACE,
-        .bInterfaceNumber = 0,
-        .bNumEndpoints = 2,
-        .bInterfaceClass = ADB_CLASS,
-        .bInterfaceSubClass = ADB_SUBCLASS,
-        .bInterfaceProtocol = ADB_PROTOCOL,
-        .iInterface = 1, /* first string from the provided table */
-    },
-    .source = {
-        .bLength = sizeof(fs_descriptors.source),
-        .bDescriptorType = USB_DT_ENDPOINT,
-        .bEndpointAddress = 1 | USB_DIR_OUT,
-        .bmAttributes = USB_ENDPOINT_XFER_BULK,
-        .wMaxPacketSize = MAX_PACKET_SIZE_FS,
-    },
-    .sink = {
-        .bLength = sizeof(fs_descriptors.sink),
-        .bDescriptorType = USB_DT_ENDPOINT,
-        .bEndpointAddress = 2 | USB_DIR_IN,
-        .bmAttributes = USB_ENDPOINT_XFER_BULK,
-        .wMaxPacketSize = MAX_PACKET_SIZE_FS,
-    },
-};
-
-static struct func_desc hs_descriptors = {
-    .intf = {
-        .bLength = sizeof(hs_descriptors.intf),
-        .bDescriptorType = USB_DT_INTERFACE,
-        .bInterfaceNumber = 0,
-        .bNumEndpoints = 2,
-        .bInterfaceClass = ADB_CLASS,
-        .bInterfaceSubClass = ADB_SUBCLASS,
-        .bInterfaceProtocol = ADB_PROTOCOL,
-        .iInterface = 1, /* first string from the provided table */
-    },
-    .source = {
-        .bLength = sizeof(hs_descriptors.source),
-        .bDescriptorType = USB_DT_ENDPOINT,
-        .bEndpointAddress = 1 | USB_DIR_OUT,
-        .bmAttributes = USB_ENDPOINT_XFER_BULK,
-        .wMaxPacketSize = MAX_PACKET_SIZE_HS,
-    },
-    .sink = {
-        .bLength = sizeof(hs_descriptors.sink),
-        .bDescriptorType = USB_DT_ENDPOINT,
-        .bEndpointAddress = 2 | USB_DIR_IN,
-        .bmAttributes = USB_ENDPOINT_XFER_BULK,
-        .wMaxPacketSize = MAX_PACKET_SIZE_HS,
-    },
-};
-
-static struct ss_func_desc ss_descriptors = {
-    .intf = {
-        .bLength = sizeof(ss_descriptors.intf),
-        .bDescriptorType = USB_DT_INTERFACE,
-        .bInterfaceNumber = 0,
-        .bNumEndpoints = 2,
-        .bInterfaceClass = ADB_CLASS,
-        .bInterfaceSubClass = ADB_SUBCLASS,
-        .bInterfaceProtocol = ADB_PROTOCOL,
-        .iInterface = 1, /* first string from the provided table */
-    },
-    .source = {
-        .bLength = sizeof(ss_descriptors.source),
-        .bDescriptorType = USB_DT_ENDPOINT,
-        .bEndpointAddress = 1 | USB_DIR_OUT,
-        .bmAttributes = USB_ENDPOINT_XFER_BULK,
-        .wMaxPacketSize = MAX_PACKET_SIZE_SS,
-    },
-    .source_comp = {
-        .bLength = sizeof(ss_descriptors.source_comp),
-        .bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
-        .bMaxBurst = 4,
-    },
-    .sink = {
-        .bLength = sizeof(ss_descriptors.sink),
-        .bDescriptorType = USB_DT_ENDPOINT,
-        .bEndpointAddress = 2 | USB_DIR_IN,
-        .bmAttributes = USB_ENDPOINT_XFER_BULK,
-        .wMaxPacketSize = MAX_PACKET_SIZE_SS,
-    },
-    .sink_comp = {
-        .bLength = sizeof(ss_descriptors.sink_comp),
-        .bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
-        .bMaxBurst = 4,
-    },
-};
-
-struct usb_ext_compat_desc os_desc_compat = {
-    .bFirstInterfaceNumber = 0,
-    .Reserved1 = (__u8) cpu_to_le32(1),
-    .CompatibleID = {0},
-    .SubCompatibleID = {0},
-    .Reserved2 = {0},
-};
-
-static struct usb_os_desc_header os_desc_header = {
-    .interface = (__u8) cpu_to_le32(1),
-    .dwLength = cpu_to_le32(sizeof(os_desc_header) + sizeof(os_desc_compat)),
-    .bcdVersion =  (__u8) cpu_to_le32(1),
-    .wIndex = (__u8) cpu_to_le32(4),
-    .bCount = (__u8) cpu_to_le32(1),
-    .Reserved = (__u8) cpu_to_le32(0),
-};
-
-#define STR_INTERFACE_ "ADB Interface"
-
-static const struct {
-    struct usb_functionfs_strings_head header;
-    struct {
-        __le16 code;
-        const char str1[sizeof(STR_INTERFACE_)];
-    } __attribute__((packed)) lang0;
-} __attribute__((packed)) strings = {
-    .header = {
-        .magic = cpu_to_le32(FUNCTIONFS_STRINGS_MAGIC),
-        .length = cpu_to_le32(sizeof(strings)),
-        .str_count = cpu_to_le32(1),
-        .lang_count = cpu_to_le32(1),
-    },
-    .lang0 = {
-        cpu_to_le16(0x0409), /* en-us */
-        STR_INTERFACE_,
-    },
-};
-
-static void aio_block_init(aio_block* aiob, unsigned num_bufs) {
-    aiob->iocb.resize(num_bufs);
-    aiob->iocbs.resize(num_bufs);
-    aiob->events.resize(num_bufs);
-    aiob->num_submitted = 0;
-    for (unsigned i = 0; i < num_bufs; i++) {
-        aiob->iocbs[i] = &aiob->iocb[i];
-    }
-    memset(&aiob->ctx, 0, sizeof(aiob->ctx));
-    if (io_setup(num_bufs, &aiob->ctx)) {
-        D("[ aio: got error on io_setup (%d) ]", errno);
+static const char* to_string(enum usb_functionfs_event_type type) {
+    switch (type) {
+        case FUNCTIONFS_BIND:
+            return "FUNCTIONFS_BIND";
+        case FUNCTIONFS_UNBIND:
+            return "FUNCTIONFS_UNBIND";
+        case FUNCTIONFS_ENABLE:
+            return "FUNCTIONFS_ENABLE";
+        case FUNCTIONFS_DISABLE:
+            return "FUNCTIONFS_DISABLE";
+        case FUNCTIONFS_SETUP:
+            return "FUNCTIONFS_SETUP";
+        case FUNCTIONFS_SUSPEND:
+            return "FUNCTIONFS_SUSPEND";
+        case FUNCTIONFS_RESUME:
+            return "FUNCTIONFS_RESUME";
     }
 }
 
-static int getMaxPacketSize(int ffs_fd) {
-    usb_endpoint_descriptor desc;
-    if (ioctl(ffs_fd, FUNCTIONFS_ENDPOINT_DESC, reinterpret_cast<unsigned long>(&desc))) {
-        D("[ could not get endpoint descriptor! (%d) ]", errno);
-        return MAX_PACKET_SIZE_HS;
-    } else {
-        return desc.wMaxPacketSize;
+template <class Payload>
+struct IoBlock {
+    bool pending = false;
+    struct iocb control = {};
+    Payload payload;
+
+    TransferId id() const { return TransferId::from_value(control.aio_data); }
+};
+
+using IoReadBlock = IoBlock<Block>;
+using IoWriteBlock = IoBlock<std::shared_ptr<Block>>;
+
+struct ScopedAioContext {
+    ScopedAioContext() = default;
+    ~ScopedAioContext() { reset(); }
+
+    ScopedAioContext(ScopedAioContext&& move) { reset(move.release()); }
+    ScopedAioContext(const ScopedAioContext& copy) = delete;
+
+    ScopedAioContext& operator=(ScopedAioContext&& move) {
+        reset(move.release());
+        return *this;
     }
-}
+    ScopedAioContext& operator=(const ScopedAioContext& copy) = delete;
 
-static bool init_functionfs(struct usb_handle* h) {
-    LOG(INFO) << "initializing functionfs";
+    static ScopedAioContext Create(size_t max_events) {
+        aio_context_t ctx = 0;
+        if (io_setup(max_events, &ctx) != 0) {
+            PLOG(FATAL) << "failed to create aio_context_t";
+        }
+        ScopedAioContext result;
+        result.reset(ctx);
+        return result;
+    }
 
-    ssize_t ret;
-    struct desc_v1 v1_descriptor;
-    struct desc_v2 v2_descriptor;
+    aio_context_t release() {
+        aio_context_t result = context_;
+        context_ = 0;
+        return result;
+    }
 
-    v2_descriptor.header.magic = cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2);
-    v2_descriptor.header.length = cpu_to_le32(sizeof(v2_descriptor));
-    v2_descriptor.header.flags = FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC |
-                                 FUNCTIONFS_HAS_SS_DESC | FUNCTIONFS_HAS_MS_OS_DESC;
-    v2_descriptor.fs_count = 3;
-    v2_descriptor.hs_count = 3;
-    v2_descriptor.ss_count = 5;
-    v2_descriptor.os_count = 1;
-    v2_descriptor.fs_descs = fs_descriptors;
-    v2_descriptor.hs_descs = hs_descriptors;
-    v2_descriptor.ss_descs = ss_descriptors;
-    v2_descriptor.os_header = os_desc_header;
-    v2_descriptor.os_desc = os_desc_compat;
-
-    if (h->control < 0) { // might have already done this before
-        LOG(INFO) << "opening control endpoint " << USB_FFS_ADB_EP0;
-        h->control.reset(adb_open(USB_FFS_ADB_EP0, O_WRONLY));
-        if (h->control < 0) {
-            PLOG(ERROR) << "cannot open control endpoint " << USB_FFS_ADB_EP0;
-            goto err;
+    void reset(aio_context_t new_context = 0) {
+        if (context_ != 0) {
+            io_destroy(context_);
         }
 
-        ret = adb_write(h->control.get(), &v2_descriptor, sizeof(v2_descriptor));
-        if (ret < 0) {
-            v1_descriptor.header.magic = cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC);
-            v1_descriptor.header.length = cpu_to_le32(sizeof(v1_descriptor));
-            v1_descriptor.header.fs_count = 3;
-            v1_descriptor.header.hs_count = 3;
-            v1_descriptor.fs_descs = fs_descriptors;
-            v1_descriptor.hs_descs = hs_descriptors;
-            D("[ %s: Switching to V1_descriptor format errno=%d ]", USB_FFS_ADB_EP0, errno);
-            ret = adb_write(h->control.get(), &v1_descriptor, sizeof(v1_descriptor));
-            if (ret < 0) {
-                D("[ %s: write descriptors failed: errno=%d ]", USB_FFS_ADB_EP0, errno);
-                goto err;
+        context_ = new_context;
+    }
+
+    aio_context_t get() { return context_; }
+
+  private:
+    aio_context_t context_ = 0;
+};
+
+struct UsbFfsConnection : public Connection {
+    UsbFfsConnection(unique_fd control, unique_fd read, unique_fd write,
+                     std::promise<void> destruction_notifier)
+        : worker_started_(false),
+          stopped_(false),
+          destruction_notifier_(std::move(destruction_notifier)),
+          control_fd_(std::move(control)),
+          read_fd_(std::move(read)),
+          write_fd_(std::move(write)) {
+        LOG(INFO) << "UsbFfsConnection constructed";
+        worker_event_fd_.reset(eventfd(0, EFD_CLOEXEC));
+        if (worker_event_fd_ == -1) {
+            PLOG(FATAL) << "failed to create eventfd";
+        }
+
+        monitor_event_fd_.reset(eventfd(0, EFD_CLOEXEC));
+        if (monitor_event_fd_ == -1) {
+            PLOG(FATAL) << "failed to create eventfd";
+        }
+
+        aio_context_ = ScopedAioContext::Create(kUsbReadQueueDepth + kUsbWriteQueueDepth);
+    }
+
+    ~UsbFfsConnection() {
+        LOG(INFO) << "UsbFfsConnection being destroyed";
+        Stop();
+        monitor_thread_.join();
+
+        // We need to explicitly close our file descriptors before we notify our destruction,
+        // because the thread listening on the future will immediately try to reopen the endpoint.
+        aio_context_.reset();
+        control_fd_.reset();
+        read_fd_.reset();
+        write_fd_.reset();
+
+        destruction_notifier_.set_value();
+    }
+
+    virtual bool Write(std::unique_ptr<apacket> packet) override final {
+        LOG(DEBUG) << "USB write: " << dump_header(&packet->msg);
+        auto header = std::make_shared<Block>(sizeof(packet->msg));
+        memcpy(header->data(), &packet->msg, sizeof(packet->msg));
+
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        write_requests_.push_back(
+                CreateWriteBlock(std::move(header), 0, sizeof(packet->msg), next_write_id_++));
+        if (!packet->payload.empty()) {
+            // The kernel attempts to allocate a contiguous block of memory for each write,
+            // which can fail if the write is large and the kernel heap is fragmented.
+            // Split large writes into smaller chunks to avoid this.
+            auto payload = std::make_shared<Block>(std::move(packet->payload));
+            size_t offset = 0;
+            size_t len = payload->size();
+
+            while (len > 0) {
+                size_t write_size = std::min(kUsbWriteSize, len);
+                write_requests_.push_back(
+                        CreateWriteBlock(payload, offset, write_size, next_write_id_++));
+                len -= write_size;
+                offset += write_size;
             }
         }
 
-        ret = adb_write(h->control.get(), &strings, sizeof(strings));
-        if (ret < 0) {
-            D("[ %s: writing strings failed: errno=%d]", USB_FFS_ADB_EP0, errno);
-            goto err;
+        // Wake up the worker thread to submit writes.
+        uint64_t notify = 1;
+        ssize_t rc = adb_write(worker_event_fd_.get(), &notify, sizeof(notify));
+        if (rc < 0) {
+            PLOG(FATAL) << "failed to notify worker eventfd to submit writes";
         }
-        //Signal only when writing the descriptors to ffs
-        android::base::SetProperty("sys.usb.ffs.ready", "1");
+
+        return true;
     }
 
-    h->bulk_out.reset(adb_open(USB_FFS_ADB_OUT, O_RDONLY));
-    if (h->bulk_out < 0) {
-        PLOG(ERROR) << "cannot open bulk-out endpoint " << USB_FFS_ADB_OUT;
-        goto err;
-    }
+    virtual void Start() override final { StartMonitor(); }
 
-    h->bulk_in.reset(adb_open(USB_FFS_ADB_IN, O_WRONLY));
-    if (h->bulk_in < 0) {
-        PLOG(ERROR) << "cannot open bulk-in endpoint " << USB_FFS_ADB_IN;
-        goto err;
-    }
-
-    h->read_aiob.fd = h->bulk_out;
-    h->write_aiob.fd = h->bulk_in;
-    h->reads_zero_packets = true;
-    return true;
-
-err:
-    h->bulk_in.reset();
-    h->bulk_out.reset();
-    h->control.reset();
-    return false;
-}
-
-static void usb_ffs_open_thread(usb_handle *usb) {
-    adb_thread_setname("usb ffs open");
-
-    while (true) {
-        // wait until the USB device needs opening
-        std::unique_lock<std::mutex> lock(usb->lock);
-        while (!usb->open_new_connection) {
-            usb->notify.wait(lock);
+    virtual void Stop() override final {
+        if (stopped_.exchange(true)) {
+            return;
         }
-        usb->open_new_connection = false;
-        lock.unlock();
+        stopped_ = true;
+        uint64_t notify = 1;
+        ssize_t rc = adb_write(worker_event_fd_.get(), &notify, sizeof(notify));
+        if (rc < 0) {
+            PLOG(FATAL) << "failed to notify worker eventfd to stop UsbFfsConnection";
+        }
+        CHECK_EQ(static_cast<size_t>(rc), sizeof(notify));
 
+        rc = adb_write(monitor_event_fd_.get(), &notify, sizeof(notify));
+        if (rc < 0) {
+            PLOG(FATAL) << "failed to notify monitor eventfd to stop UsbFfsConnection";
+        }
+
+        CHECK_EQ(static_cast<size_t>(rc), sizeof(notify));
+    }
+
+    virtual bool DoTlsHandshake(RSA* key, std::string* auth_key) override final {
+        // TODO: support TLS for usb connections.
+        LOG(FATAL) << "Not supported yet.";
+        return false;
+    }
+
+  private:
+    void StartMonitor() {
+        // This is a bit of a mess.
+        // It's possible for io_submit to end up blocking, if we call it as the endpoint
+        // becomes disabled. Work around this by having a monitor thread to listen for functionfs
+        // lifecycle events. If we notice an error condition (either we've become disabled, or we
+        // were never enabled in the first place), we send interruption signals to the worker thread
+        // until it dies, and then report failure to the transport via HandleError, which will
+        // eventually result in the transport being destroyed, which will result in UsbFfsConnection
+        // being destroyed, which unblocks the open thread and restarts this entire process.
+        static std::once_flag handler_once;
+        std::call_once(handler_once, []() { signal(kInterruptionSignal, [](int) {}); });
+
+        monitor_thread_ = std::thread([this]() {
+            adb_thread_setname("UsbFfs-monitor");
+            LOG(INFO) << "UsbFfs-monitor thread spawned";
+
+            bool bound = false;
+            bool enabled = false;
+            bool running = true;
+            while (running) {
+                adb_pollfd pfd[2] = {
+                  { .fd = control_fd_.get(), .events = POLLIN, .revents = 0 },
+                  { .fd = monitor_event_fd_.get(), .events = POLLIN, .revents = 0 },
+                };
+
+                // If we don't see our first bind within a second, try again.
+                int timeout_ms = bound ? -1 : 1000;
+
+                int rc = TEMP_FAILURE_RETRY(adb_poll(pfd, 2, timeout_ms));
+                if (rc == -1) {
+                    PLOG(FATAL) << "poll on USB control fd failed";
+                } else if (rc == 0) {
+                    LOG(WARNING) << "timed out while waiting for FUNCTIONFS_BIND, trying again";
+                    break;
+                }
+
+                if (pfd[1].revents) {
+                    // We were told to die.
+                    break;
+                }
+
+                struct usb_functionfs_event event;
+                rc = TEMP_FAILURE_RETRY(adb_read(control_fd_.get(), &event, sizeof(event)));
+                if (rc == -1) {
+                    PLOG(FATAL) << "failed to read functionfs event";
+                } else if (rc == 0) {
+                    LOG(WARNING) << "hit EOF on functionfs control fd";
+                    break;
+                } else if (rc != sizeof(event)) {
+                    LOG(FATAL) << "read functionfs event of unexpected size, expected "
+                               << sizeof(event) << ", got " << rc;
+                }
+
+                LOG(INFO) << "USB event: "
+                          << to_string(static_cast<usb_functionfs_event_type>(event.type));
+
+                switch (event.type) {
+                    case FUNCTIONFS_BIND:
+                        if (bound) {
+                            LOG(WARNING) << "received FUNCTIONFS_BIND while already bound?";
+                            running = false;
+                            break;
+                        }
+
+                        if (enabled) {
+                            LOG(WARNING) << "received FUNCTIONFS_BIND while already enabled?";
+                            running = false;
+                            break;
+                        }
+
+                        bound = true;
+                        break;
+
+                    case FUNCTIONFS_ENABLE:
+                        if (!bound) {
+                            LOG(WARNING) << "received FUNCTIONFS_ENABLE while not bound?";
+                            running = false;
+                            break;
+                        }
+
+                        if (enabled) {
+                            LOG(WARNING) << "received FUNCTIONFS_ENABLE while already enabled?";
+                            running = false;
+                            break;
+                        }
+
+                        enabled = true;
+                        StartWorker();
+                        break;
+
+                    case FUNCTIONFS_DISABLE:
+                        if (!bound) {
+                            LOG(WARNING) << "received FUNCTIONFS_DISABLE while not bound?";
+                        }
+
+                        if (!enabled) {
+                            LOG(WARNING) << "received FUNCTIONFS_DISABLE while not enabled?";
+                        }
+
+                        enabled = false;
+                        running = false;
+                        break;
+
+                    case FUNCTIONFS_UNBIND:
+                        if (enabled) {
+                            LOG(WARNING) << "received FUNCTIONFS_UNBIND while still enabled?";
+                        }
+
+                        if (!bound) {
+                            LOG(WARNING) << "received FUNCTIONFS_UNBIND when not bound?";
+                        }
+
+                        bound = false;
+                        running = false;
+                        break;
+
+                    case FUNCTIONFS_SETUP: {
+                        LOG(INFO) << "received FUNCTIONFS_SETUP control transfer: bRequestType = "
+                                  << static_cast<int>(event.u.setup.bRequestType)
+                                  << ", bRequest = " << static_cast<int>(event.u.setup.bRequest)
+                                  << ", wValue = " << static_cast<int>(event.u.setup.wValue)
+                                  << ", wIndex = " << static_cast<int>(event.u.setup.wIndex)
+                                  << ", wLength = " << static_cast<int>(event.u.setup.wLength);
+
+                        if ((event.u.setup.bRequestType & USB_DIR_IN)) {
+                            LOG(INFO) << "acking device-to-host control transfer";
+                            ssize_t rc = adb_write(control_fd_.get(), "", 0);
+                            if (rc != 0) {
+                                PLOG(ERROR) << "failed to write empty packet to host";
+                                break;
+                            }
+                        } else {
+                            std::string buf;
+                            buf.resize(event.u.setup.wLength + 1);
+
+                            ssize_t rc = adb_read(control_fd_.get(), buf.data(), buf.size());
+                            if (rc != event.u.setup.wLength) {
+                                LOG(ERROR)
+                                        << "read " << rc
+                                        << " bytes when trying to read control request, expected "
+                                        << event.u.setup.wLength;
+                            }
+
+                            LOG(INFO) << "control request contents: " << buf;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            StopWorker();
+            HandleError("monitor thread finished");
+        });
+    }
+
+    void StartWorker() {
+        CHECK(!worker_started_);
+        worker_started_ = true;
+        worker_thread_ = std::thread([this]() {
+            adb_thread_setname("UsbFfs-worker");
+            LOG(INFO) << "UsbFfs-worker thread spawned";
+
+            for (size_t i = 0; i < kUsbReadQueueDepth; ++i) {
+                read_requests_[i] = CreateReadBlock(next_read_id_++);
+                if (!SubmitRead(&read_requests_[i])) {
+                    return;
+                }
+            }
+
+            while (!stopped_) {
+                uint64_t dummy;
+                ssize_t rc = adb_read(worker_event_fd_.get(), &dummy, sizeof(dummy));
+                if (rc == -1) {
+                    PLOG(FATAL) << "failed to read from eventfd";
+                } else if (rc == 0) {
+                    LOG(FATAL) << "hit EOF on eventfd";
+                }
+
+                ReadEvents();
+
+                std::lock_guard<std::mutex> lock(write_mutex_);
+                SubmitWrites();
+            }
+        });
+    }
+
+    void StopWorker() {
+        if (!worker_started_) {
+            return;
+        }
+
+        pthread_t worker_thread_handle = worker_thread_.native_handle();
         while (true) {
-            if (init_functionfs(usb)) {
-                LOG(INFO) << "functionfs successfully initialized";
+            int rc = pthread_kill(worker_thread_handle, kInterruptionSignal);
+            if (rc != 0) {
+                LOG(ERROR) << "failed to send interruption signal to worker: " << strerror(rc);
                 break;
             }
-            std::this_thread::sleep_for(1s);
+
+            std::this_thread::sleep_for(100ms);
+
+            rc = pthread_kill(worker_thread_handle, 0);
+            if (rc == 0) {
+                continue;
+            } else if (rc == ESRCH) {
+                break;
+            } else {
+                LOG(ERROR) << "failed to send interruption signal to worker: " << strerror(rc);
+            }
         }
 
-        LOG(INFO) << "registering usb transport";
-        register_usb_transport(usb, nullptr, nullptr, 1);
+        worker_thread_.join();
     }
 
-    // never gets here
-    abort();
-}
-
-static int usb_ffs_write(usb_handle* h, const void* data, int len) {
-    D("about to write (fd=%d, len=%d)", h->bulk_in.get(), len);
-
-    const char* buf = static_cast<const char*>(data);
-    int orig_len = len;
-    while (len > 0) {
-        int write_len = std::min(USB_FFS_BULK_SIZE, len);
-        int n = adb_write(h->bulk_in, buf, write_len);
-        if (n < 0) {
-            D("ERROR: fd = %d, n = %d: %s", h->bulk_in.get(), n, strerror(errno));
-            return -1;
+    void PrepareReadBlock(IoReadBlock* block, uint64_t id) {
+        block->pending = false;
+        if (block->payload.capacity() >= kUsbReadSize) {
+            block->payload.resize(kUsbReadSize);
+        } else {
+            block->payload = Block(kUsbReadSize);
         }
-        buf += n;
-        len -= n;
+        block->control.aio_data = static_cast<uint64_t>(TransferId::read(id));
+        block->control.aio_buf = reinterpret_cast<uintptr_t>(block->payload.data());
+        block->control.aio_nbytes = block->payload.size();
     }
 
-    D("[ done fd=%d ]", h->bulk_in.get());
-    return orig_len;
-}
+    IoReadBlock CreateReadBlock(uint64_t id) {
+        IoReadBlock block;
+        PrepareReadBlock(&block, id);
+        block.control.aio_rw_flags = 0;
+        block.control.aio_lio_opcode = IOCB_CMD_PREAD;
+        block.control.aio_reqprio = 0;
+        block.control.aio_fildes = read_fd_.get();
+        block.control.aio_offset = 0;
+        block.control.aio_flags = IOCB_FLAG_RESFD;
+        block.control.aio_resfd = worker_event_fd_.get();
+        return block;
+    }
 
-static int usb_ffs_read(usb_handle* h, void* data, int len) {
-    D("about to read (fd=%d, len=%d)", h->bulk_out.get(), len);
-
-    char* buf = static_cast<char*>(data);
-    int orig_len = len;
-    while (len > 0) {
-        int read_len = std::min(USB_FFS_BULK_SIZE, len);
-        int n = adb_read(h->bulk_out, buf, read_len);
-        if (n < 0) {
-            D("ERROR: fd = %d, n = %d: %s", h->bulk_out.get(), n, strerror(errno));
-            return -1;
+    void ReadEvents() {
+        static constexpr size_t kMaxEvents = kUsbReadQueueDepth + kUsbWriteQueueDepth;
+        struct io_event events[kMaxEvents];
+        struct timespec timeout = {.tv_sec = 0, .tv_nsec = 0};
+        int rc = io_getevents(aio_context_.get(), 0, kMaxEvents, events, &timeout);
+        if (rc == -1) {
+            HandleError(StringPrintf("io_getevents failed while reading: %s", strerror(errno)));
+            return;
         }
-        buf += n;
-        len -= n;
-    }
 
-    D("[ done fd=%d ]", h->bulk_out.get());
-    return orig_len;
-}
+        for (int event_idx = 0; event_idx < rc; ++event_idx) {
+            auto& event = events[event_idx];
+            TransferId id = TransferId::from_value(event.data);
 
-static int usb_ffs_do_aio(usb_handle* h, const void* data, int len, bool read) {
-    aio_block* aiob = read ? &h->read_aiob : &h->write_aiob;
-    bool zero_packet = false;
+            if (event.res < 0) {
+                // On initial connection, some clients will send a ClearFeature(HALT) to
+                // attempt to resynchronize host and device after the adb server is killed.
+                // On newer device kernels, the reads we've already dispatched will be cancelled.
+                // Instead of treating this as a failure, which will tear down the interface and
+                // lead to the client doing the same thing again, just resubmit if this happens
+                // before we've actually read anything.
+                if (!connection_started_ && event.res == -EPIPE &&
+                    id.direction == TransferDirection::READ) {
+                    uint64_t read_idx = id.id % kUsbReadQueueDepth;
+                    SubmitRead(&read_requests_[read_idx]);
+                    continue;
+                } else {
+                    std::string error =
+                            StringPrintf("%s %" PRIu64 " failed with error %s",
+                                         id.direction == TransferDirection::READ ? "read" : "write",
+                                         id.id, strerror(-event.res));
+                    HandleError(error);
+                    return;
+                }
+            }
 
-    int num_bufs = len / h->io_size + (len % h->io_size == 0 ? 0 : 1);
-    const char* cur_data = reinterpret_cast<const char*>(data);
-    int packet_size = getMaxPacketSize(aiob->fd);
-
-    if (posix_madvise(const_cast<void*>(data), len, POSIX_MADV_SEQUENTIAL | POSIX_MADV_WILLNEED) <
-        0) {
-        D("[ Failed to madvise: %d ]", errno);
-    }
-
-    for (int i = 0; i < num_bufs; i++) {
-        int buf_len = std::min(len, static_cast<int>(h->io_size));
-        io_prep(&aiob->iocb[i], aiob->fd, cur_data, buf_len, 0, read);
-
-        len -= buf_len;
-        cur_data += buf_len;
-
-        if (len == 0 && buf_len % packet_size == 0 && read) {
-            // adb does not expect the device to send a zero packet after data transfer,
-            // but the host *does* send a zero packet for the device to read.
-            zero_packet = h->reads_zero_packets;
+            if (id.direction == TransferDirection::READ) {
+                connection_started_ = true;
+                if (!HandleRead(id, event.res)) {
+                    return;
+                }
+            } else {
+                HandleWrite(id);
+            }
         }
     }
-    if (zero_packet) {
-        io_prep(&aiob->iocb[num_bufs], aiob->fd, reinterpret_cast<const void*>(cur_data),
-                packet_size, 0, read);
-        num_bufs += 1;
+
+    bool HandleRead(TransferId id, int64_t size) {
+        uint64_t read_idx = id.id % kUsbReadQueueDepth;
+        IoReadBlock* block = &read_requests_[read_idx];
+        block->pending = false;
+        block->payload.resize(size);
+
+        // Notification for completed reads can be received out of order.
+        if (block->id().id != needed_read_id_) {
+            LOG(VERBOSE) << "read " << block->id().id << " completed while waiting for "
+                         << needed_read_id_;
+            return true;
+        }
+
+        for (uint64_t id = needed_read_id_;; ++id) {
+            size_t read_idx = id % kUsbReadQueueDepth;
+            IoReadBlock* current_block = &read_requests_[read_idx];
+            if (current_block->pending) {
+                break;
+            }
+            if (!ProcessRead(current_block)) {
+                return false;
+            }
+            ++needed_read_id_;
+        }
+
+        return true;
     }
+
+    bool ProcessRead(IoReadBlock* block) {
+        if (!block->payload.empty()) {
+            if (!incoming_header_.has_value()) {
+                if (block->payload.size() != sizeof(amessage)) {
+                    HandleError("received packet of unexpected length while reading header");
+                    return false;
+                }
+                amessage& msg = incoming_header_.emplace();
+                memcpy(&msg, block->payload.data(), sizeof(msg));
+                LOG(DEBUG) << "USB read:" << dump_header(&msg);
+                incoming_header_ = msg;
+            } else {
+                size_t bytes_left = incoming_header_->data_length - incoming_payload_.size();
+                if (block->payload.size() > bytes_left) {
+                    HandleError("received too many bytes while waiting for payload");
+                    return false;
+                }
+                incoming_payload_.append(std::move(block->payload));
+            }
+
+            if (incoming_header_->data_length == incoming_payload_.size()) {
+                auto packet = std::make_unique<apacket>();
+                packet->msg = *incoming_header_;
+
+                // TODO: Make apacket contain an IOVector so we don't have to coalesce.
+                packet->payload = std::move(incoming_payload_).coalesce();
+                transport_->HandleRead(std::move(packet));
+
+                incoming_header_.reset();
+                // reuse the capacity of the incoming payload while we can.
+                auto free_block = incoming_payload_.clear();
+                if (block->payload.capacity() == 0) {
+                    block->payload = std::move(free_block);
+                }
+            }
+        }
+
+        PrepareReadBlock(block, block->id().id + kUsbReadQueueDepth);
+        SubmitRead(block);
+        return true;
+    }
+
+    bool SubmitRead(IoReadBlock* block) {
+        block->pending = true;
+        struct iocb* iocb = &block->control;
+        if (io_submit(aio_context_.get(), 1, &iocb) != 1) {
+            HandleError(StringPrintf("failed to submit read: %s", strerror(errno)));
+            return false;
+        }
+
+        return true;
+    }
+
+    void HandleWrite(TransferId id) {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        auto it =
+                std::find_if(write_requests_.begin(), write_requests_.end(), [id](const auto& req) {
+                    return static_cast<uint64_t>(req.id()) == static_cast<uint64_t>(id);
+                });
+        CHECK(it != write_requests_.end());
+
+        write_requests_.erase(it);
+        size_t outstanding_writes = --writes_submitted_;
+        LOG(DEBUG) << "USB write: reaped, down to " << outstanding_writes;
+    }
+
+    IoWriteBlock CreateWriteBlock(std::shared_ptr<Block> payload, size_t offset, size_t len,
+                                  uint64_t id) {
+        auto block = IoWriteBlock();
+        block.payload = std::move(payload);
+        block.control.aio_data = static_cast<uint64_t>(TransferId::write(id));
+        block.control.aio_rw_flags = 0;
+        block.control.aio_lio_opcode = IOCB_CMD_PWRITE;
+        block.control.aio_reqprio = 0;
+        block.control.aio_fildes = write_fd_.get();
+        block.control.aio_buf = reinterpret_cast<uintptr_t>(block.payload->data() + offset);
+        block.control.aio_nbytes = len;
+        block.control.aio_offset = 0;
+        block.control.aio_flags = IOCB_FLAG_RESFD;
+        block.control.aio_resfd = worker_event_fd_.get();
+        return block;
+    }
+
+    IoWriteBlock CreateWriteBlock(Block&& payload, uint64_t id) {
+        size_t len = payload.size();
+        return CreateWriteBlock(std::make_shared<Block>(std::move(payload)), 0, len, id);
+    }
+
+    void SubmitWrites() REQUIRES(write_mutex_) {
+        if (writes_submitted_ == kUsbWriteQueueDepth) {
+            return;
+        }
+
+        ssize_t writes_to_submit = std::min(kUsbWriteQueueDepth - writes_submitted_,
+                                            write_requests_.size() - writes_submitted_);
+        CHECK_GE(writes_to_submit, 0);
+        if (writes_to_submit == 0) {
+            return;
+        }
+
+        struct iocb* iocbs[kUsbWriteQueueDepth];
+        for (int i = 0; i < writes_to_submit; ++i) {
+            CHECK(!write_requests_[writes_submitted_ + i].pending);
+            write_requests_[writes_submitted_ + i].pending = true;
+            iocbs[i] = &write_requests_[writes_submitted_ + i].control;
+            LOG(VERBOSE) << "submitting write_request " << static_cast<void*>(iocbs[i]);
+        }
+
+        writes_submitted_ += writes_to_submit;
+
+        int rc = io_submit(aio_context_.get(), writes_to_submit, iocbs);
+        if (rc == -1) {
+            HandleError(StringPrintf("failed to submit write requests: %s", strerror(errno)));
+            return;
+        } else if (rc != writes_to_submit) {
+            LOG(FATAL) << "failed to submit all writes: wanted to submit " << writes_to_submit
+                       << ", actually submitted " << rc;
+        }
+    }
+
+    void HandleError(const std::string& error) {
+        std::call_once(error_flag_, [&]() {
+            if (transport_) {
+                transport_->HandleError(error);
+            }
+
+            if (!stopped_) {
+                Stop();
+            }
+        });
+    }
+
+    std::thread monitor_thread_;
+
+    bool worker_started_;
+    std::thread worker_thread_;
+
+    std::atomic<bool> stopped_;
+    std::promise<void> destruction_notifier_;
+    std::once_flag error_flag_;
+
+    unique_fd worker_event_fd_;
+    unique_fd monitor_event_fd_;
+
+    ScopedAioContext aio_context_;
+    unique_fd control_fd_;
+    unique_fd read_fd_;
+    unique_fd write_fd_;
+
+    bool connection_started_ = false;
+    std::optional<amessage> incoming_header_;
+    IOVector incoming_payload_;
+
+    std::array<IoReadBlock, kUsbReadQueueDepth> read_requests_;
+    IOVector read_data_;
+
+    // ID of the next request that we're going to send out.
+    size_t next_read_id_ = 0;
+
+    // ID of the next packet we're waiting for.
+    size_t needed_read_id_ = 0;
+
+    std::mutex write_mutex_;
+    std::deque<IoWriteBlock> write_requests_ GUARDED_BY(write_mutex_);
+    size_t next_write_id_ GUARDED_BY(write_mutex_) = 0;
+    size_t writes_submitted_ GUARDED_BY(write_mutex_) = 0;
+
+    static constexpr int kInterruptionSignal = SIGUSR1;
+};
+
+static void usb_ffs_open_thread() {
+    adb_thread_setname("usb ffs open");
+
+    // When the device is acting as a USB host, we'll be unable to bind to the USB gadget on kernels
+    // that don't carry a downstream patch to enable that behavior.
+    //
+    // This property is copied from vendor.sys.usb.adb.disabled by an init.rc script.
+    //
+    // Note that this property only disables rebinding the USB gadget: setting it while an interface
+    // is already bound will do nothing.
+    static const char* kPropertyUsbDisabled = "sys.usb.adb.disabled";
+    PropertyMonitor prop_mon;
+    prop_mon.Add(kPropertyUsbDisabled, [](std::string value) {
+        // Return false (i.e. break out of PropertyMonitor::Run) when the property != 1.
+        return android::base::ParseBool(value) == android::base::ParseBoolResult::kTrue;
+    });
 
     while (true) {
-        if (TEMP_FAILURE_RETRY(io_submit(aiob->ctx, num_bufs, aiob->iocbs.data())) < num_bufs) {
-            PLOG(ERROR) << "aio: got error submitting " << (read ? "read" : "write");
-            return -1;
-        }
-        if (TEMP_FAILURE_RETRY(io_getevents(aiob->ctx, num_bufs, num_bufs, aiob->events.data(),
-                                            nullptr)) < num_bufs) {
-            PLOG(ERROR) << "aio: got error waiting " << (read ? "read" : "write");
-            return -1;
-        }
-        if (num_bufs == 1 && aiob->events[0].res == -EINTR) {
+        unique_fd control;
+        unique_fd bulk_out;
+        unique_fd bulk_in;
+        if (!open_functionfs(&control, &bulk_out, &bulk_in)) {
+            std::this_thread::sleep_for(1s);
             continue;
         }
-        int ret = 0;
-        for (int i = 0; i < num_bufs; i++) {
-            if (aiob->events[i].res < 0) {
-                errno = -aiob->events[i].res;
-                PLOG(ERROR) << "aio: got error event on " << (read ? "read" : "write")
-                            << " total bufs " << num_bufs;
-                return -1;
-            }
-            ret += aiob->events[i].res;
+
+        if (android::base::GetBoolProperty(kPropertyUsbDisabled, false)) {
+            LOG(INFO) << "pausing USB due to " << kPropertyUsbDisabled;
+            prop_mon.Run();
+            LOG(INFO) << "resuming USB";
         }
-        return ret;
+
+        atransport* transport = new atransport();
+        transport->serial = "UsbFfs";
+        std::promise<void> destruction_notifier;
+        std::future<void> future = destruction_notifier.get_future();
+        transport->SetConnection(std::make_unique<UsbFfsConnection>(
+                std::move(control), std::move(bulk_out), std::move(bulk_in),
+                std::move(destruction_notifier)));
+        register_transport(transport);
+        future.wait();
     }
-}
-
-static int usb_ffs_aio_read(usb_handle* h, void* data, int len) {
-    return usb_ffs_do_aio(h, data, len, true);
-}
-
-static int usb_ffs_aio_write(usb_handle* h, const void* data, int len) {
-    return usb_ffs_do_aio(h, data, len, false);
-}
-
-static void usb_ffs_kick(usb_handle* h) {
-    int err;
-
-    err = ioctl(h->bulk_in.get(), FUNCTIONFS_CLEAR_HALT);
-    if (err < 0) {
-        D("[ kick: source (fd=%d) clear halt failed (%d) ]", h->bulk_in.get(), errno);
-    }
-
-    err = ioctl(h->bulk_out.get(), FUNCTIONFS_CLEAR_HALT);
-    if (err < 0) {
-        D("[ kick: sink (fd=%d) clear halt failed (%d) ]", h->bulk_out.get(), errno);
-    }
-
-    // don't close ep0 here, since we may not need to reinitialize it with
-    // the same descriptors again. if however ep1/ep2 fail to re-open in
-    // init_functionfs, only then would we close and open ep0 again.
-    // Ditto the comment in usb_adb_kick.
-    h->kicked = true;
-    TEMP_FAILURE_RETRY(dup2(dummy_fd.get(), h->bulk_out.get()));
-    TEMP_FAILURE_RETRY(dup2(dummy_fd.get(), h->bulk_in.get()));
-}
-
-static void usb_ffs_close(usb_handle* h) {
-    LOG(INFO) << "closing functionfs transport";
-
-    h->kicked = false;
-    h->bulk_out.reset();
-    h->bulk_in.reset();
-
-    // Notify usb_adb_open_thread to open a new connection.
-    h->lock.lock();
-    h->open_new_connection = true;
-    h->lock.unlock();
-    h->notify.notify_one();
-}
-
-usb_handle *create_usb_handle(unsigned num_bufs, unsigned io_size) {
-    usb_handle* h = new usb_handle();
-
-    if (android::base::GetBoolProperty("sys.usb.ffs.aio_compat", false)) {
-        // Devices on older kernels (< 3.18) will not have aio support for ffs
-        // unless backported. Fall back on the non-aio functions instead.
-        h->write = usb_ffs_write;
-        h->read = usb_ffs_read;
-    } else {
-        h->write = usb_ffs_aio_write;
-        h->read = usb_ffs_aio_read;
-        aio_block_init(&h->read_aiob, num_bufs);
-        aio_block_init(&h->write_aiob, num_bufs);
-    }
-    h->io_size = io_size;
-    h->kick = usb_ffs_kick;
-    h->close = usb_ffs_close;
-    return h;
 }
 
 void usb_init() {
-    D("[ usb_init - using FunctionFS ]");
-    dummy_fd.reset(adb_open("/dev/null", O_WRONLY | O_CLOEXEC));
-    CHECK_NE(-1, dummy_fd.get());
-
-    std::thread(usb_ffs_open_thread, create_usb_handle(USB_FFS_NUM_BUFS, USB_FFS_BULK_SIZE)).detach();
-}
-
-int usb_write(usb_handle* h, const void* data, int len) {
-    return h->write(h, data, len);
-}
-
-int usb_read(usb_handle* h, void* data, int len) {
-    return h->read(h, data, len);
-}
-
-int usb_close(usb_handle* h) {
-    h->close(h);
-    return 0;
-}
-
-void usb_kick(usb_handle* h) {
-    h->kick(h);
+    std::thread(usb_ffs_open_thread).detach();
 }

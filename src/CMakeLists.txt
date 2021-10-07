@@ -11,7 +11,22 @@ ADD_CUSTOM_COMMAND(
             ${CMAKE_CURRENT_SOURCE_DIR}/version.cmake)
 set(version_src ${CMAKE_CURRENT_BINARY_DIR}/version.cpp)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
+
+find_package(Protobuf REQUIRED)
+
+set(PROTOS
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto/adb_known_hosts.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto/app_processes.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto/key_type.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto/pairing.proto
+)
+
+set(PROTO_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+file(MAKE_DIRECTORY ${PROTO_SRC_DIR})
+include_directories(${PROTO_SRC_DIR})
+
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTOS})
 
 set(libadb_srcs
     ${version_src}
@@ -21,22 +36,23 @@ set(libadb_srcs
     adb_trace.cpp
     adb_unique_fd.cpp
     adb_utils.cpp
-    fdevent.cpp
+    fdevent/fdevent.cpp
     services.cpp
     sockets.cpp
     socket_spec.cpp
     sysdeps/errno.cpp
+    ${PROTO_SRCS}
     transport.cpp
     transport_fd.cpp
-    transport_local.cpp
-    transport_usb.cpp
    )
 
 
 set(libadb_host_src
     client/auth.cpp
     #    client/usb_libusb.cpp
-    client/usb_dispatch.cpp
+    # client/usb_dispatch.cpp
+    client/transport_local.cpp
+    client/transport_usb.cpp
     #    client/transport_mdns.cpp
     client/fastdeploy.cpp
     client/fastdeploycallbacks.cpp
@@ -63,6 +79,7 @@ set(windows_srcs
    )
 
 set(adb_cmd_srcs
+    ${PROTO_SRCS}
     client/adb_client.cpp
     client/bugreport.cpp
     client/commandline.cpp
@@ -229,6 +246,9 @@ target_compile_definitions(adbd
     PRIVATE ALLOW_ADBD_NO_AUTH=1
 )
 
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/crypto/include
+)
 target_include_directories(adbd
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/include

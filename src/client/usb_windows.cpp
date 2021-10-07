@@ -18,6 +18,8 @@
 
 #include "sysdeps.h"
 
+#include "client/usb.h"
+
 // clang-format off
 #include <winsock2.h>  // winsock.h *must* be included before windows.h.
 #include <windows.h>
@@ -41,8 +43,6 @@
 #include "sysdeps/chrono.h"
 #include "transport.h"
 
-namespace native {
-
 /** Structure usb_handle describes our connection to the usb device via
   AdbWinApi.dll. This structure is returned from usb_open() routine and
   is expected in each subsequent call that is accessing the device.
@@ -51,7 +51,7 @@ namespace native {
   rely on AdbWinApi.dll's handle validation and AdbCloseHandle(endpoint)'s
   ability to break a thread out of pipe IO.
 */
-struct usb_handle : public ::usb_handle {
+struct usb_handle {
     /// Handle to USB interface
     ADBAPIHANDLE adb_interface;
 
@@ -172,6 +172,7 @@ void device_poll_thread() {
 
     while (true) {
         find_devices();
+        adb_notify_device_scan_complete();
         std::this_thread::sleep_for(1s);
     }
 }
@@ -212,8 +213,8 @@ static void _power_notification_thread() {
     const HINSTANCE instance = GetModuleHandleW(nullptr);
     if (!instance) {
         // This is such a common API call that this should never fail.
-        fatal("GetModuleHandleW failed: %s",
-              android::base::SystemErrorCodeToString(GetLastError()).c_str());
+        LOG(FATAL) << "GetModuleHandleW failed: "
+                   << android::base::SystemErrorCodeToString(GetLastError());
     }
 
     WNDCLASSEXW wndclass;
@@ -223,15 +224,15 @@ static void _power_notification_thread() {
     wndclass.hInstance = instance;
     wndclass.lpszClassName = kPowerNotificationWindowClassName;
     if (!RegisterClassExW(&wndclass)) {
-        fatal("RegisterClassExW failed: %s",
-              android::base::SystemErrorCodeToString(GetLastError()).c_str());
+        LOG(FATAL) << "RegisterClassExW failed: "
+                   << android::base::SystemErrorCodeToString(GetLastError());
     }
 
     if (!CreateWindowExW(WS_EX_NOACTIVATE, kPowerNotificationWindowClassName,
                          L"ADB Power Notification Window", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
                          instance, nullptr)) {
-        fatal("CreateWindowExW failed: %s",
-              android::base::SystemErrorCodeToString(GetLastError()).c_str());
+        LOG(FATAL) << "CreateWindowExW failed: "
+                   << android::base::SystemErrorCodeToString(GetLastError());
     }
 
     MSG msg;
@@ -448,6 +449,11 @@ void usb_cleanup_handle(usb_handle* handle) {
     }
 }
 
+void usb_reset(usb_handle* handle) {
+    // Unimplemented on Windows.
+    usb_kick(handle);
+}
+
 static void usb_kick_locked(usb_handle* handle) {
     // The reason the lock must be acquired before calling this function is in
     // case multiple threads are trying to kick the same device at the same time.
@@ -609,5 +615,3 @@ static void kick_devices() {
         usb_kick_locked(usb);
     }
 }
-
-}  // namespace native

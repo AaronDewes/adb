@@ -26,25 +26,25 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include <android-base/strings.h>
+
 #if !ADB_HOST
 #include <android-base/properties.h>
-#if !ADB_NON_ANDROID
 #include <log/log_properties.h>
-#else
-static int __android_log_is_debuggable() {
-    return 0;
-}
-#endif
 #endif
 
 #include "adb.h"
 #include "adb_io.h"
+#include "adb_utils.h"
 #include "transport.h"
 #include "types.h"
+
+using namespace std::chrono_literals;
 
 static std::recursive_mutex& local_socket_list_lock = *new std::recursive_mutex();
 static unsigned local_socket_next_id = 1;
@@ -84,7 +84,7 @@ void install_local_socket(asocket* s) {
 
     // Socket ids should never be 0.
     if (local_socket_next_id == 0) {
-        fatal("local socket id overflow");
+        LOG(FATAL) << "local socket id overflow";
     }
 
     local_socket_list.push_back(s);
@@ -125,8 +125,7 @@ static SocketFlushResult local_socket_flush_incoming(asocket* s) {
         if (rc > 0 && static_cast<size_t>(rc) == s->packet_queue.size()) {
             s->packet_queue.clear();
         } else if (rc > 0) {
-            // TODO: Implement a faster drop_front?
-            s->packet_queue.take_front(rc);
+            s->packet_queue.drop_front(rc);
             fdevent_add(s->fde, FDE_WRITE);
             return SocketFlushResult::TryAgain;
         } else if (rc == -1 && errno == EAGAIN) {
@@ -243,16 +242,64 @@ static void local_socket_ready(asocket* s) {
     fdevent_add(s->fde, FDE_READ);
 }
 
+struct ClosingSocket {
+    std::chrono::steady_clock::time_point begin;
+};
+
+// The standard (RFC 1122 - 4.2.2.13) says that if we call close on a
+// socket while we have pending data, a TCP RST should be sent to the
+// other end to notify it that we didn't read all of its data. However,
+// this can result in data that we've successfully written out to be dropped
+// on the other end. To avoid this, instead of immediately closing a
+// socket, call shutdown on it instead, and then read from the file
+// descriptor until we hit EOF or an error before closing.
+static void deferred_close(unique_fd fd) {
+    // Shutdown the socket in the outgoing direction only, so that
+    // we don't have the same problem on the opposite end.
+    adb_shutdown(fd.get(), SHUT_WR);
+    auto callback = [](fdevent* fde, unsigned event, void* arg) {
+        auto socket_info = static_cast<ClosingSocket*>(arg);
+        if (event & FDE_READ) {
+            ssize_t rc;
+            char buf[BUFSIZ];
+            while ((rc = adb_read(fde->fd.get(), buf, sizeof(buf))) > 0) {
+                continue;
+            }
+
+            if (rc == -1 && errno == EAGAIN) {
+                // There's potentially more data to read.
+                auto duration = std::chrono::steady_clock::now() - socket_info->begin;
+                if (duration > 1s) {
+                    LOG(WARNING) << "timeout expired while flushing socket, closing";
+                } else {
+                    return;
+                }
+            }
+        } else if (event & FDE_TIMEOUT) {
+            LOG(WARNING) << "timeout expired while flushing socket, closing";
+        }
+
+        // Either there was an error, we hit the end of the socket, or our timeout expired.
+        fdevent_destroy(fde);
+        delete socket_info;
+    };
+
+    ClosingSocket* socket_info = new ClosingSocket{
+            .begin = std::chrono::steady_clock::now(),
+    };
+
+    fdevent* fde = fdevent_create(fd.release(), callback, socket_info);
+    fdevent_add(fde, FDE_READ);
+    fdevent_set_timeout(fde, 1s);
+}
+
 // be sure to hold the socket list lock when calling this
 static void local_socket_destroy(asocket* s) {
     int exit_on_close = s->exit_on_close;
 
     D("LS(%d): destroying fde.fd=%d", s->id, s->fd);
 
-    /* IMPORTANT: the remove closes the fd
-    ** that belongs to this socket
-    */
-    fdevent_destroy(s->fde);
+    deferred_close(fdevent_release(s->fde));
 
     remove_socket(s);
     delete s;
@@ -338,7 +385,8 @@ static void local_socket_event_func(int fd, unsigned ev, void* _s) {
     }
 }
 
-asocket* create_local_socket(int fd) {
+asocket* create_local_socket(unique_fd ufd) {
+    int fd = ufd.release();
     asocket* s = new asocket();
     s->fd = fd;
     s->enqueue = local_socket_enqueue;
@@ -352,28 +400,25 @@ asocket* create_local_socket(int fd) {
     return s;
 }
 
-asocket* create_local_service_socket(const char* name, atransport* transport) {
-#if !ADB_HOST && !ADB_NON_ANDROID
-    if (!strcmp(name, "jdwp")) {
-        return create_jdwp_service_socket();
-    }
-    if (!strcmp(name, "track-jdwp")) {
-        return create_jdwp_tracker_service_socket();
+asocket* create_local_service_socket(std::string_view name, atransport* transport) {
+#if !ADB_HOST
+    if (asocket* s = daemon_service_to_socket(name); s) {
+        return s;
     }
 #endif
-    int fd = service_to_fd(name, transport);
+    unique_fd fd = service_to_fd(name, transport);
     if (fd < 0) {
         return nullptr;
     }
 
-    asocket* s = create_local_socket(fd);
-    D("LS(%d): bound to '%s' via %d", s->id, name, fd);
+    int fd_value = fd.get();
+    asocket* s = create_local_socket(std::move(fd));
+    LOG(VERBOSE) << "LS(" << s->id << "): bound to '" << name << "' via " << fd_value;
 
 #if !ADB_HOST
-    if ((!strncmp(name, "root:", 5) && getuid() != 0 && __android_log_is_debuggable()) ||
-        (!strncmp(name, "unroot:", 7) && getuid() == 0) ||
-        !strncmp(name, "usb:", 4) ||
-        !strncmp(name, "tcpip:", 6)) {
+    if ((name.starts_with("root:") && getuid() != 0 && __android_log_is_debuggable()) ||
+        (name.starts_with("unroot:") && getuid() == 0) || name.starts_with("usb:") ||
+        name.starts_with("tcpip:")) {
         D("LS(%d): enabling exit_on_close", s->id);
         s->exit_on_close = 1;
     }
@@ -381,22 +426,6 @@ asocket* create_local_service_socket(const char* name, atransport* transport) {
 
     return s;
 }
-
-#if ADB_HOST
-static asocket* create_host_service_socket(const char* name, const char* serial,
-                                           TransportId transport_id) {
-    asocket* s;
-
-    s = host_service_to_socket(name, serial, transport_id);
-
-    if (s != nullptr) {
-        D("LS(%d) bound to '%s'", s->id, name);
-        return s;
-    }
-
-    return s;
-}
-#endif /* ADB_HOST */
 
 static int remote_socket_enqueue(asocket* s, apacket::payload_type data) {
     D("entered remote_socket_enqueue RS(%d) WRITE fd=%d peer.fd=%d", s->id, s->fd, s->peer->fd);
@@ -457,7 +486,7 @@ static void remote_socket_close(asocket* s) {
 // Returns a new non-NULL asocket handle.
 asocket* create_remote_socket(unsigned id, atransport* t) {
     if (id == 0) {
-        fatal("invalid remote socket id (0)");
+        LOG(FATAL) << "invalid remote socket id (0)";
     }
     asocket* s = new asocket();
     s->id = id;
@@ -471,25 +500,27 @@ asocket* create_remote_socket(unsigned id, atransport* t) {
     return s;
 }
 
-void connect_to_remote(asocket* s, const char* destination) {
+void connect_to_remote(asocket* s, std::string_view destination) {
     D("Connect_to_remote call RS(%d) fd=%d", s->id, s->fd);
     apacket* p = get_apacket();
 
-    D("LS(%d): connect('%s')", s->id, destination);
+    LOG(VERBOSE) << "LS(" << s->id << ": connect(" << destination << ")";
     p->msg.command = A_OPEN;
     p->msg.arg0 = s->id;
 
-    // adbd expects a null-terminated string.
-    p->payload.assign(destination, destination + strlen(destination) + 1);
+    // adbd used to expect a null-terminated string.
+    // Keep doing so to maintain backward compatibility.
+    p->payload.resize(destination.size() + 1);
+    memcpy(p->payload.data(), destination.data(), destination.size());
+    p->payload[destination.size()] = '\0';
     p->msg.data_length = p->payload.size();
 
-    if (p->msg.data_length > s->get_max_payload()) {
-        fatal("destination oversized");
-    }
+    CHECK_LE(p->msg.data_length, s->get_max_payload());
 
     send_packet(p, s->transport);
 }
 
+#if ADB_HOST
 /* this is used by magic sockets to rig local sockets to
    send the go-ahead message when they connect */
 static void local_socket_ready_notify(asocket* s) {
@@ -554,74 +585,139 @@ static unsigned unhex(const char* s, int len) {
     return n;
 }
 
-#if ADB_HOST
-
 namespace internal {
 
-// Returns the position in |service| following the target serial parameter. Serial format can be
-// any of:
+// Parses a host service string of the following format:
 //   * [tcp:|udp:]<serial>[:<port>]:<command>
 //   * <prefix>:<serial>:<command>
 // Where <port> must be a base-10 number and <prefix> may be any of {usb,product,model,device}.
-//
-// The returned pointer will point to the ':' just before <command>, or nullptr if not found.
-char* skip_host_serial(char* service) {
-    static const std::vector<std::string>& prefixes =
-        *(new std::vector<std::string>{"usb:", "product:", "model:", "device:"});
+bool parse_host_service(std::string_view* out_serial, std::string_view* out_command,
+                        std::string_view full_service) {
+    if (full_service.empty()) {
+        return false;
+    }
 
-    for (const std::string& prefix : prefixes) {
-        if (!strncmp(service, prefix.c_str(), prefix.length())) {
-            return strchr(service + prefix.length(), ':');
+    std::string_view serial;
+    std::string_view command = full_service;
+    // Remove |count| bytes from the beginning of command and add them to |serial|.
+    auto consume = [&full_service, &serial, &command](size_t count) {
+        CHECK_LE(count, command.size());
+        if (!serial.empty()) {
+            CHECK_EQ(serial.data() + serial.size(), command.data());
+        }
+
+        serial = full_service.substr(0, serial.size() + count);
+        command.remove_prefix(count);
+    };
+
+    // Remove the trailing : from serial, and assign the values to the output parameters.
+    auto finish = [out_serial, out_command, &serial, &command] {
+        if (serial.empty() || command.empty()) {
+            return false;
+        }
+
+        CHECK_EQ(':', serial.back());
+        serial.remove_suffix(1);
+
+        *out_serial = serial;
+        *out_command = command;
+        return true;
+    };
+
+    static constexpr std::string_view prefixes[] = {
+            "usb:", "product:", "model:", "device:", "localfilesystem:"};
+    for (std::string_view prefix : prefixes) {
+        if (command.starts_with(prefix)) {
+            consume(prefix.size());
+
+            size_t offset = command.find_first_of(':');
+            if (offset == std::string::npos) {
+                return false;
+            }
+            consume(offset + 1);
+            return finish();
         }
     }
 
     // For fastboot compatibility, ignore protocol prefixes.
-    if (!strncmp(service, "tcp:", 4) || !strncmp(service, "udp:", 4)) {
-        service += 4;
+    if (command.starts_with("tcp:") || command.starts_with("udp:")) {
+        consume(4);
+        if (command.empty()) {
+            return false;
+        }
+    }
+    if (command.starts_with("vsock:")) {
+        // vsock serials are vsock:cid:port, which have an extra colon compared to tcp.
+        size_t next_colon = command.find(':');
+        if (next_colon == std::string::npos) {
+            return false;
+        }
+        consume(next_colon + 1);
     }
 
-    // Check for an IPv6 address. `adb connect` creates the serial number from the canonical
-    // network address so it will always have the [] delimiters.
-    if (service[0] == '[') {
-        char* ipv6_end = strchr(service, ']');
-        if (ipv6_end != nullptr) {
-            service = ipv6_end;
+    bool found_address = false;
+    if (command[0] == '[') {
+        // Read an IPv6 address. `adb connect` creates the serial number from the canonical
+        // network address so it will always have the [] delimiters.
+        size_t ipv6_end = command.find_first_of(']');
+        if (ipv6_end != std::string::npos) {
+            consume(ipv6_end + 1);
+            if (command.empty()) {
+                // Nothing after the IPv6 address.
+                return false;
+            } else if (command[0] != ':') {
+                // Garbage after the IPv6 address.
+                return false;
+            }
+            consume(1);
+            found_address = true;
         }
     }
 
-    // The next colon we find must either begin the port field or the command field.
-    char* colon_ptr = strchr(service, ':');
-    if (!colon_ptr) {
-        // No colon in service string.
-        return nullptr;
+    if (!found_address) {
+        // Scan ahead to the next colon.
+        size_t offset = command.find_first_of(':');
+        if (offset == std::string::npos) {
+            return false;
+        }
+        consume(offset + 1);
     }
 
-    // If the next field is only decimal digits and ends with another colon, it's a port.
-    char* serial_end = colon_ptr;
-    if (isdigit(serial_end[1])) {
-        serial_end++;
-        while (*serial_end && isdigit(*serial_end)) {
-            serial_end++;
-        }
-        if (*serial_end != ':') {
-            // Something other than "<port>:" was found, this must be the command field instead.
-            serial_end = colon_ptr;
+    // We're either at the beginning of a port, or the command itself.
+    // Look for a port in between colons.
+    size_t next_colon = command.find_first_of(':');
+    if (next_colon == std::string::npos) {
+        // No colon, we must be at the command.
+        return finish();
+    }
+
+    bool port_valid = true;
+    if (command.size() <= next_colon) {
+        return false;
+    }
+
+    std::string_view port = command.substr(0, next_colon);
+    for (auto digit : port) {
+        if (!isdigit(digit)) {
+            // Port isn't a number.
+            port_valid = false;
+            break;
         }
     }
-    return serial_end;
+
+    if (port_valid) {
+        consume(next_colon + 1);
+    }
+    return finish();
 }
 
 }  // namespace internal
 
-#endif  // ADB_HOST
-
 static int smart_socket_enqueue(asocket* s, apacket::payload_type data) {
-#if ADB_HOST
-    char* service = nullptr;
-    char* serial = nullptr;
+    std::string_view service;
+    std::string_view serial;
     TransportId transport_id = 0;
     TransportType type = kTransportAny;
-#endif
 
     D("SS(%d): enqueue %zu", s->id, data.size());
 
@@ -654,62 +750,65 @@ static int smart_socket_enqueue(asocket* s, apacket::payload_type data) {
 
     D("SS(%d): '%s'", s->id, (char*)(s->smart_socket_data.data() + 4));
 
-#if ADB_HOST
-    service = &s->smart_socket_data[4];
-    if (!strncmp(service, "host-serial:", strlen("host-serial:"))) {
-        char* serial_end;
-        service += strlen("host-serial:");
+    service = std::string_view(s->smart_socket_data).substr(4);
 
+    // TODO: These should be handled in handle_host_request.
+    if (android::base::ConsumePrefix(&service, "host-serial:")) {
         // serial number should follow "host:" and could be a host:port string.
-        serial_end = internal::skip_host_serial(service);
-        if (serial_end) {
-            *serial_end = 0;  // terminate string
-            serial = service;
-            service = serial_end + 1;
+        if (!internal::parse_host_service(&serial, &service, service)) {
+            LOG(ERROR) << "SS(" << s->id << "): failed to parse host service: " << service;
+            goto fail;
         }
-    } else if (!strncmp(service, "host-transport-id:", strlen("host-transport-id:"))) {
-        service += strlen("host-transport-id:");
-        transport_id = strtoll(service, &service, 10);
-
-        if (*service != ':') {
+    } else if (android::base::ConsumePrefix(&service, "host-transport-id:")) {
+        if (!ParseUint(&transport_id, service, &service)) {
+            LOG(ERROR) << "SS(" << s->id << "): failed to parse host transport id: " << service;
             return -1;
         }
-        service++;
-    } else if (!strncmp(service, "host-usb:", strlen("host-usb:"))) {
+        if (!android::base::ConsumePrefix(&service, ":")) {
+            LOG(ERROR) << "SS(" << s->id << "): host-transport-id without command";
+            return -1;
+        }
+    } else if (android::base::ConsumePrefix(&service, "host-usb:")) {
         type = kTransportUsb;
-        service += strlen("host-usb:");
-    } else if (!strncmp(service, "host-local:", strlen("host-local:"))) {
+    } else if (android::base::ConsumePrefix(&service, "host-local:")) {
         type = kTransportLocal;
-        service += strlen("host-local:");
-    } else if (!strncmp(service, "host:", strlen("host:"))) {
+    } else if (android::base::ConsumePrefix(&service, "host:")) {
         type = kTransportAny;
-        service += strlen("host:");
     } else {
-        service = nullptr;
+        service = std::string_view{};
     }
 
-    if (service) {
+    if (!service.empty()) {
         asocket* s2;
 
         // Some requests are handled immediately -- in that case the handle_host_request() routine
         // has sent the OKAY or FAIL message and all we have to do is clean up.
-        if (handle_host_request(service, type, serial, transport_id, s->peer->fd, s)) {
-            D("SS(%d): handled host service '%s'", s->id, service);
-            goto fail;
-        }
-        if (!strncmp(service, "transport", strlen("transport"))) {
-            D("SS(%d): okay transport", s->id);
-            s->smart_socket_data.clear();
-            return 0;
+        auto host_request_result = handle_host_request(
+                service, type, serial.empty() ? nullptr : std::string(serial).c_str(), transport_id,
+                s->peer->fd, s);
+
+        switch (host_request_result) {
+            case HostRequestResult::Handled:
+                LOG(VERBOSE) << "SS(" << s->id << "): handled host service '" << service << "'";
+                goto fail;
+
+            case HostRequestResult::SwitchedTransport:
+                D("SS(%d): okay transport", s->id);
+                s->smart_socket_data.clear();
+                return 0;
+
+            case HostRequestResult::Unhandled:
+                break;
         }
 
         /* try to find a local service with this name.
         ** if no such service exists, we'll fail out
         ** and tear down here.
         */
-        s2 = create_host_service_socket(service, serial, transport_id);
+        // TODO: Convert to string_view.
+        s2 = host_service_to_socket(service, serial, transport_id);
         if (s2 == nullptr) {
-            D("SS(%d): couldn't create host service '%s'", s->id, service);
+            LOG(VERBOSE) << "SS(" << s->id << "): couldn't create host service '" << service << "'";
             SendFail(s->peer->fd, "unknown host service");
             goto fail;
         }
@@ -736,16 +835,6 @@ static int smart_socket_enqueue(asocket* s, apacket::payload_type data) {
         s2->ready(s2);
         return 0;
     }
-#else /* !ADB_HOST */
-    if (s->transport == nullptr) {
-        std::string error_msg = "unknown failure";
-        s->transport = acquire_one_transport(kTransportAny, nullptr, 0, nullptr, &error_msg);
-        if (s->transport == nullptr) {
-            SendFail(s->peer->fd, error_msg);
-            goto fail;
-        }
-    }
-#endif
 
     if (!s->transport) {
         SendFail(s->peer->fd, "device offline (no transport)");
@@ -767,10 +856,10 @@ static int smart_socket_enqueue(asocket* s, apacket::payload_type data) {
     s->peer->shutdown = nullptr;
     s->peer->close = local_socket_close_notify;
     s->peer->peer = nullptr;
-    /* give him our transport and upref it */
+    /* give them our transport and upref it */
     s->peer->transport = s->transport;
 
-    connect_to_remote(s->peer, s->smart_socket_data.data() + 4);
+    connect_to_remote(s->peer, std::string_view(s->smart_socket_data).substr(4));
     s->peer = nullptr;
     s->close(s);
     return 1;
@@ -817,6 +906,7 @@ void connect_to_smartsocket(asocket* s) {
     ss->peer = s;
     s->ready(s);
 }
+#endif
 
 size_t asocket::get_max_payload() const {
     size_t max_payload = MAX_PAYLOAD;

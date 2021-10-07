@@ -17,3 +17,4 @@ libtool
 .dirstamp
 src/arm_adb
 src/arm_adb-main.o
+build

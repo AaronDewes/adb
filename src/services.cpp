@@ -24,7 +24,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <cstring>
 #include <thread>
+
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <cutils/sockets.h>
@@ -33,6 +35,7 @@
 #include "adb_io.h"
 #include "adb_unique_fd.h"
 #include "adb_utils.h"
+#include "adb_wifi.h"
 #include "services.h"
 #include "socket_spec.h"
 #include "sysdeps.h"
@@ -63,80 +66,35 @@ unique_fd create_service_thread(const char* service_name, std::function<void(uni
         adb_setsockopt(s[0], SOL_SOCKET, SO_SNDBUF, &max_buf, sizeof(max_buf));
         adb_setsockopt(s[1], SOL_SOCKET, SO_SNDBUF, &max_buf, sizeof(max_buf));
     }
-#endif // !ADB_HOST
+#endif  // !ADB_HOST
 
     std::thread(service_bootstrap_func, service_name, func, unique_fd(s[1])).detach();
 
-    D("service thread started, %d:%d",s[0], s[1]);
+    D("service thread started, %d:%d", s[0], s[1]);
     return unique_fd(s[0]);
 }
 
-int service_to_fd(const char* name, atransport* transport) {
-    int ret = -1;
+unique_fd service_to_fd(std::string_view name, atransport* transport) {
+    unique_fd ret;
 
     if (is_socket_spec(name)) {
         std::string error;
-        ret = socket_spec_connect(name, &error);
-        if (ret < 0) {
+        if (!socket_spec_connect(&ret, name, nullptr, nullptr, &error)) {
             LOG(ERROR) << "failed to connect to socket '" << name << "': " << error;
         }
     } else {
 #if !ADB_HOST
-        ret = daemon_service_to_fd(name, transport).release();
+        ret = daemon_service_to_fd(name, transport);
 #endif
     }
 
     if (ret >= 0) {
-        close_on_exec(ret);
+        close_on_exec(ret.get());
     }
     return ret;
 }
 
 #if ADB_HOST
-struct state_info {
-    TransportType transport_type;
-    std::string serial;
-    TransportId transport_id;
-    ConnectionState state;
-};
-
-static void wait_for_state(int fd, void* data) {
-    std::unique_ptr<state_info> sinfo(reinterpret_cast<state_info*>(data));
-
-    D("wait_for_state %d", sinfo->state);
-
-    while (true) {
-        bool is_ambiguous = false;
-        std::string error = "unknown error";
-        const char* serial = sinfo->serial.length() ? sinfo->serial.c_str() : nullptr;
-        atransport* t = acquire_one_transport(sinfo->transport_type, serial, sinfo->transport_id,
-                                              &is_ambiguous, &error);
-        if (t != nullptr && (sinfo->state == kCsAny || sinfo->state == t->GetConnectionState())) {
-            SendOkay(fd);
-            break;
-        } else if (!is_ambiguous) {
-            adb_pollfd pfd = {.fd = fd, .events = POLLIN };
-            int rc = adb_poll(&pfd, 1, 1000);
-            if (rc < 0) {
-                SendFail(fd, error);
-                break;
-            } else if (rc > 0 && (pfd.revents & POLLHUP) != 0) {
-                // The other end of the socket is closed, probably because the other side was
-                // terminated, bail out.
-                break;
-            }
-
-            // Try again...
-        } else {
-            SendFail(fd, error);
-            break;
-        }
-    }
-
-    adb_close(fd);
-    D("wait_for_state is done");
-}
-
 void connect_emulator(const std::string& port_spec, std::string* response) {
     std::vector<std::string> pieces = android::base::Split(port_spec, ",");
     if (pieces.size() != 2) {
@@ -181,72 +139,133 @@ static void connect_service(unique_fd fd, std::string host) {
     if (!strncmp(host.c_str(), "emu:", 4)) {
         connect_emulator(host.c_str() + 4, &response);
     } else {
-        connect_device(host.c_str(), &response);
+        connect_device(host, &response);
     }
 
     // Send response for emulator and device
     SendProtocolString(fd.get(), response);
 }
+
+static void pair_service(unique_fd fd, std::string host, std::string password) {
+    std::string response;
+    adb_wifi_pair_device(host, password, response);
+    SendProtocolString(fd.get(), response);
+}
+
+static void wait_service(unique_fd fd, std::string serial, TransportId transport_id,
+                         std::string spec) {
+    std::vector<std::string> components = android::base::Split(spec, "-");
+    if (components.size() < 2) {
+        SendFail(fd, "short wait-for-: " + spec);
+        return;
+    }
+
+    TransportType transport_type;
+    if (components[0] == "local") {
+        transport_type = kTransportLocal;
+    } else if (components[0] == "usb") {
+        transport_type = kTransportUsb;
+    } else if (components[0] == "any") {
+        transport_type = kTransportAny;
+    } else {
+        SendFail(fd, "bad wait-for- transport: " + spec);
+        return;
+    }
+
+    std::vector<ConnectionState> states;
+    for (size_t i = 1; i < components.size(); ++i) {
+        if (components[i] == "device") {
+            states.push_back(kCsDevice);
+        } else if (components[i] == "recovery") {
+            states.push_back(kCsRecovery);
+        } else if (components[i] == "rescue") {
+            states.push_back(kCsRescue);
+        } else if (components[i] == "sideload") {
+            states.push_back(kCsSideload);
+        } else if (components[i] == "bootloader") {
+            states.push_back(kCsBootloader);
+        } else if (components[i] == "any") {
+            states.push_back(kCsAny);
+        } else if (components[i] == "disconnect") {
+            states.push_back(kCsOffline);
+        } else {
+            SendFail(fd, "bad wait-for- state: " + spec);
+            return;
+        }
+    }
+
+    while (true) {
+        bool is_ambiguous = false;
+        std::string error = "unknown error";
+        atransport* t =
+                acquire_one_transport(transport_type, !serial.empty() ? serial.c_str() : nullptr,
+                                      transport_id, &is_ambiguous, &error);
+
+        for (const auto& state : states) {
+            if (state == kCsOffline) {
+                // Special case for wait-for-disconnect:
+                // We want to wait for USB devices to completely disappear, but TCP devices can
+                // go into the offline state, since we automatically reconnect.
+                if (!t) {
+                    SendOkay(fd);
+                    return;
+                } else if (!t->GetUsbHandle()) {
+                    SendOkay(fd);
+                    return;
+                }
+            } else {
+                if (t && (state == kCsAny || state == t->GetConnectionState())) {
+                    SendOkay(fd);
+                    return;
+                }
+            }
+        }
+
+        if (is_ambiguous) {
+            SendFail(fd, error);
+            return;
+        }
+
+        // Sleep before retrying.
+        adb_pollfd pfd = {.fd = fd.get(), .events = POLLIN};
+        if (adb_poll(&pfd, 1, 100) != 0) {
+            // The other end of the socket is closed, probably because the
+            // client terminated. Bail out.
+            SendFail(fd, error);
+            return;
+        }
+    }
+}
 #endif
 
 #if ADB_HOST
-asocket* host_service_to_socket(const char* name, const char* serial, TransportId transport_id) {
-    if (!strcmp(name,"track-devices")) {
+asocket* host_service_to_socket(std::string_view name, std::string_view serial,
+                                TransportId transport_id) {
+    if (name == "track-devices") {
         return create_device_tracker(false);
-    } else if (!strcmp(name, "track-devices-l")) {
+    } else if (name == "track-devices-l") {
         return create_device_tracker(true);
-    } else if (android::base::StartsWith(name, "wait-for-")) {
-        name += strlen("wait-for-");
-
-        std::unique_ptr<state_info> sinfo = std::make_unique<state_info>();
-        if (sinfo == nullptr) {
-            fprintf(stderr, "couldn't allocate state_info: %s", strerror(errno));
+    } else if (android::base::ConsumePrefix(&name, "wait-for-")) {
+        std::string spec(name);
+        unique_fd fd =
+                create_service_thread("wait", std::bind(wait_service, std::placeholders::_1,
+                                                        std::string(serial), transport_id, spec));
+        return create_local_socket(std::move(fd));
+    } else if (android::base::ConsumePrefix(&name, "connect:")) {
+        std::string host(name);
+        unique_fd fd = create_service_thread(
+                "connect", std::bind(connect_service, std::placeholders::_1, host));
+        return create_local_socket(std::move(fd));
+    } else if (android::base::ConsumePrefix(&name, "pair:")) {
+        const char* divider = strchr(name.data(), ':');
+        if (!divider) {
             return nullptr;
         }
-
-        if (serial) sinfo->serial = serial;
-        sinfo->transport_id = transport_id;
-
-        if (android::base::StartsWith(name, "local")) {
-            name += strlen("local");
-            sinfo->transport_type = kTransportLocal;
-        } else if (android::base::StartsWith(name, "usb")) {
-            name += strlen("usb");
-            sinfo->transport_type = kTransportUsb;
-        } else if (android::base::StartsWith(name, "any")) {
-            name += strlen("any");
-            sinfo->transport_type = kTransportAny;
-        } else {
-            return nullptr;
-        }
-
-        if (!strcmp(name, "-device")) {
-            sinfo->state = kCsDevice;
-        } else if (!strcmp(name, "-recovery")) {
-            sinfo->state = kCsRecovery;
-        } else if (!strcmp(name, "-sideload")) {
-            sinfo->state = kCsSideload;
-        } else if (!strcmp(name, "-bootloader")) {
-            sinfo->state = kCsBootloader;
-        } else if (!strcmp(name, "-any")) {
-            sinfo->state = kCsAny;
-        } else {
-            return nullptr;
-        }
-
-        int fd = create_service_thread(
-                         "wait", std::bind(wait_for_state, std::placeholders::_1, sinfo.get()))
-                         .release();
-        if (fd != -1) {
-            sinfo.release();
-        }
-        return create_local_socket(fd);
-    } else if (!strncmp(name, "connect:", 8)) {
-        std::string host(name + strlen("connect:"));
-        int fd = create_service_thread("connect",
-                                       std::bind(connect_service, std::placeholders::_1, host))
-                         .release();
-        return create_local_socket(fd);
+        std::string password(name.data(), divider);
+        std::string host(divider + 1);
+        unique_fd fd = create_service_thread(
+                "pair", std::bind(pair_service, std::placeholders::_1, host, password));
+        return create_local_socket(std::move(fd));
     }
     return nullptr;
 }

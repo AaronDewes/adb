@@ -18,6 +18,8 @@
 
 #include "sysdeps.h"
 
+#include "client/usb.h"
+
 #include <CoreFoundation/CoreFoundation.h>
 
 #include <IOKit/IOKitLib.h>
@@ -45,7 +47,6 @@
 
 using namespace std::chrono_literals;
 
-namespace native {
 struct usb_handle
 {
     UInt8 bulkIn;
@@ -136,8 +137,8 @@ AndroidInterfaceAdded(io_iterator_t iterator)
     io_service_t             usbDevice;
     io_service_t             usbInterface;
     IOCFPlugInInterface      **plugInInterface = NULL;
-    IOUSBInterfaceInterface220  **iface = NULL;
-    IOUSBDeviceInterface197  **dev = NULL;
+    IOUSBInterfaceInterface500  **iface = NULL;
+    IOUSBDeviceInterface500  **dev = NULL;
     HRESULT                  result;
     SInt32                   score;
     uint32_t                 locationId;
@@ -163,7 +164,7 @@ AndroidInterfaceAdded(io_iterator_t iterator)
         //* This gets us the interface object
         result = (*plugInInterface)->QueryInterface(
             plugInInterface,
-            CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID), (LPVOID*)&iface);
+            CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID500), (LPVOID*)&iface);
         //* We only needed the plugin to get the interface, so discard it
         (*plugInInterface)->Release(plugInInterface);
         if (result || !iface) {
@@ -209,7 +210,7 @@ AndroidInterfaceAdded(io_iterator_t iterator)
         }
 
         result = (*plugInInterface)->QueryInterface(plugInInterface,
-            CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID), (LPVOID*)&dev);
+            CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID500), (LPVOID*)&dev);
         //* only needed this to query the plugin
         (*plugInInterface)->Release(plugInInterface);
         if (result || !dev) {
@@ -461,6 +462,7 @@ void usb_init() {
             std::this_thread::sleep_for(100ms);
         }
 
+        adb_notify_device_scan_complete();
         initialized = true;
     }
 }
@@ -556,6 +558,11 @@ int usb_close(usb_handle *handle)
     return 0;
 }
 
+void usb_reset(usb_handle* handle) {
+    // Unimplemented on OS X.
+    usb_kick(handle);
+}
+
 static void usb_kick_locked(usb_handle *handle)
 {
     LOG(INFO) << "Kicking handle";
@@ -580,5 +587,3 @@ void usb_kick(usb_handle *handle) {
 size_t usb_get_max_packet_size(usb_handle* handle) {
     return handle->max_packet_size;
 }
-
-} // namespace native

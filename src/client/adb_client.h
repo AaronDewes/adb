@@ -16,15 +16,30 @@
 
 #pragma once
 
+#include <functional>
+#include <optional>
+#include <string>
+
 #include "adb.h"
+#include "adb_unique_fd.h"
 #include "sysdeps.h"
 #include "transport.h"
 
-#include <string>
+// Explicitly check the adb server version.
+// All of the commands below do this implicitly.
+// Only the first invocation of this function will check the server version.
+bool adb_check_server_version(std::string* _Nonnull error);
 
 // Connect to adb, connect to the named service, and return a valid fd for
 // interacting with that service upon success or a negative number on failure.
-int adb_connect(const std::string& service, std::string* _Nonnull error);
+int adb_connect(std::string_view service, std::string* _Nonnull error);
+
+// Same as above, except returning the TransportId for the service that we've connected to.
+// force_switch_device forces the function to attempt to select a device, even if the service
+// string appears to be a host: service (for use with host services that are device specific, like
+// forward).
+int adb_connect(TransportId* _Nullable id, std::string_view service, std::string* _Nonnull error,
+                bool force_switch_device = false);
 
 // Kill the currently running adb server, if it exists.
 bool adb_kill_server();
@@ -36,7 +51,7 @@ bool adb_command(const std::string& service);
 // Connects to the named adb service and fills 'result' with the response.
 // Returns true on success; returns false and fills 'error' on failure.
 bool adb_query(const std::string& service, std::string* _Nonnull result,
-               std::string* _Nonnull error);
+               std::string* _Nonnull error, bool force_switch_device = false);
 
 // Set the preferred transport to connect to.
 void adb_set_transport(TransportType type, const char* _Nullable serial, TransportId transport_id);
@@ -55,10 +70,20 @@ int adb_send_emulator_command(int argc, const char* _Nonnull* _Nonnull argv,
 
 // Reads a standard adb status response (OKAY|FAIL) and returns true in the
 // event of OKAY, false in the event of FAIL or protocol error.
-bool adb_status(int fd, std::string* _Nonnull error);
+bool adb_status(borrowed_fd fd, std::string* _Nonnull error);
 
 // Create a host command corresponding to selected transport type/serial.
 std::string format_host_command(const char* _Nonnull command);
 
 // Get the feature set of the current preferred transport.
-bool adb_get_feature_set(FeatureSet* _Nonnull feature_set, std::string* _Nonnull error);
+const std::optional<FeatureSet>& adb_get_feature_set(std::string* _Nullable error);
+
+#if defined(__linux__)
+// Get the path of a file containing the path to the server executable, if the socket spec set via
+// adb_set_socket_spec is a local one.
+std::optional<std::string> adb_get_server_executable_path();
+#endif
+
+// Globally acccesible argv/envp, for the purpose of re-execing adb.
+extern const char* _Nullable * _Nullable __adb_argv;
+extern const char* _Nullable * _Nullable __adb_envp;
