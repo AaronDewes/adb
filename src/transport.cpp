@@ -17,7 +17,6 @@
 #define TRACE_TAG TRANSPORT
 
 #include "sysdeps.h"
-#include "sysdeps/memory.h"
 
 #include "transport.h"
 
@@ -30,18 +29,21 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <deque>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
 
+#include <adb/crypto/rsa_2048_key.h>
+#include <adb/crypto/x509_generator.h>
+#include <adb/tls/tls_connection.h>
 #include <android-base/logging.h>
+#include <android-base/no_destructor.h>
 #include <android-base/parsenetaddress.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/thread_annotations.h>
-
 #include <diagnose_usb.h>
 
 #include "adb.h"
@@ -49,12 +51,20 @@
 #include "adb_io.h"
 #include "adb_trace.h"
 #include "adb_utils.h"
-#include "fdevent.h"
+#include "fdevent/fdevent.h"
 #include "sysdeps/chrono.h"
 
-static void register_transport(atransport* transport);
+#if ADB_HOST
+#include "client/usb.h"
+#endif
+
+using namespace adb::crypto;
+using namespace adb::tls;
+using android::base::ScopedLockAssertion;
+using TlsError = TlsConnection::TlsError;
+
 static void remove_transport(atransport* transport);
-static void transport_unref(atransport* transport);
+static void transport_destroy(atransport* transport);
 
 // TODO: unordered_map<TransportId, atransport*>
 static auto& transport_list = *new std::list<atransport*>();
@@ -65,21 +75,25 @@ static auto& transport_lock = *new std::recursive_mutex();
 const char* const kFeatureShell2 = "shell_v2";
 const char* const kFeatureCmd = "cmd";
 const char* const kFeatureStat2 = "stat_v2";
+const char* const kFeatureLs2 = "ls_v2";
 const char* const kFeatureLibusb = "libusb";
 const char* const kFeaturePushSync = "push_sync";
+const char* const kFeatureApex = "apex";
+const char* const kFeatureFixedPushMkdir = "fixed_push_mkdir";
+const char* const kFeatureAbb = "abb";
+const char* const kFeatureFixedPushSymlinkTimestamp = "fixed_push_symlink_timestamp";
+const char* const kFeatureAbbExec = "abb_exec";
+const char* const kFeatureRemountShell = "remount_shell";
+const char* const kFeatureTrackApp = "track_app";
+const char* const kFeatureSendRecv2 = "sendrecv_v2";
+const char* const kFeatureSendRecv2Brotli = "sendrecv_v2_brotli";
+const char* const kFeatureSendRecv2LZ4 = "sendrecv_v2_lz4";
+const char* const kFeatureSendRecv2Zstd = "sendrecv_v2_zstd";
+const char* const kFeatureSendRecv2DryRunSend = "sendrecv_v2_dry_run_send";
+// TODO(joshuaduong): Bump to v2 when openscreen discovery is enabled by default
+const char* const kFeatureOpenscreenMdns = "openscreen_mdns";
 
 namespace {
-
-// A class that helps the Clang Thread Safety Analysis deal with
-// std::unique_lock. Given that std::unique_lock is movable, and the analysis
-// can not currently perform alias analysis, it is not annotated. In order to
-// assert that the mutex is held, a ScopedAssumeLocked can be created just after
-// the std::unique_lock.
-class SCOPED_CAPABILITY ScopedAssumeLocked {
-  public:
-    ScopedAssumeLocked(std::mutex& mutex) ACQUIRE(mutex) {}
-    ~ScopedAssumeLocked() RELEASE() {}
-};
 
 #if ADB_HOST
 // Tracks and handles atransport*s that are attempting reconnection.
@@ -120,8 +134,8 @@ class ReconnectHandler {
     };
 
     // Only retry for up to one minute.
-    static constexpr const std::chrono::seconds kDefaultTimeout = 10s;
-    static constexpr const size_t kMaxAttempts = 6;
+    static constexpr const std::chrono::seconds kDefaultTimeout = 3s;
+    static constexpr const size_t kMaxAttempts = 20;
 
     // Protects all members.
     std::mutex reconnect_mutex_;
@@ -132,8 +146,6 @@ class ReconnectHandler {
 
     DISALLOW_COPY_AND_ASSIGN(ReconnectHandler);
 };
-
-constexpr const std::chrono::seconds ReconnectHandler::kDefaultTimeout;
 
 void ReconnectHandler::Start() {
     check_main_thread();
@@ -180,7 +192,7 @@ void ReconnectHandler::Run() {
         ReconnectAttempt attempt;
         {
             std::unique_lock<std::mutex> lock(reconnect_mutex_);
-            ScopedAssumeLocked assume_lock(reconnect_mutex_);
+            ScopedLockAssertion assume_lock(reconnect_mutex_);
 
             if (!reconnect_queue_.empty()) {
                 // FIXME: libstdc++ (used on Windows) implements condition_variable with
@@ -196,7 +208,6 @@ void ReconnectHandler::Run() {
 
             // Scan the whole list for kicked transports, so that we immediately handle an explicit
             // disconnect request.
-            bool kicked = false;
             for (auto it = reconnect_queue_.begin(); it != reconnect_queue_.end();) {
                 if (it->transport->kicked()) {
                     D("transport %s was kicked. giving up on it.", it->transport->serial.c_str());
@@ -205,7 +216,6 @@ void ReconnectHandler::Run() {
                 } else {
                     ++it;
                 }
-                kicked = true;
             }
 
             if (reconnect_queue_.empty()) continue;
@@ -264,39 +274,36 @@ TransportId NextTransportId() {
     return next++;
 }
 
+void Connection::Reset() {
+    LOG(INFO) << "Connection::Reset(): stopping";
+    Stop();
+}
+
+std::string Connection::Serial() const {
+    return transport_ ? transport_->serial_name() : "<unknown>";
+}
+
 BlockingConnectionAdapter::BlockingConnectionAdapter(std::unique_ptr<BlockingConnection> connection)
     : underlying_(std::move(connection)) {}
 
 BlockingConnectionAdapter::~BlockingConnectionAdapter() {
-    LOG(INFO) << "BlockingConnectionAdapter(" << this->transport_name_ << "): destructing";
+    LOG(INFO) << "BlockingConnectionAdapter(" << Serial() << "): destructing";
     Stop();
 }
 
 void BlockingConnectionAdapter::Start() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (started_) {
-        LOG(FATAL) << "BlockingConnectionAdapter(" << this->transport_name_
-                   << "): started multiple times";
+        LOG(FATAL) << "BlockingConnectionAdapter(" << Serial() << "): started multiple times";
     }
 
-    read_thread_ = std::thread([this]() {
-        LOG(INFO) << this->transport_name_ << ": read thread spawning";
-        while (true) {
-            auto packet = std::make_unique<apacket>();
-            if (!underlying_->Read(packet.get())) {
-                PLOG(INFO) << this->transport_name_ << ": read failed";
-                break;
-            }
-            read_callback_(this, std::move(packet));
-        }
-        std::call_once(this->error_flag_, [this]() { this->error_callback_(this, "read failed"); });
-    });
+    StartReadThread();
 
     write_thread_ = std::thread([this]() {
-        LOG(INFO) << this->transport_name_ << ": write thread spawning";
+        LOG(INFO) << Serial() << ": write thread spawning";
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_);
-            ScopedAssumeLocked assume_locked(mutex_);
+            ScopedLockAssertion assume_locked(mutex_);
             cv_.wait(lock, [this]() REQUIRES(mutex_) {
                 return this->stopped_ || !this->write_queue_.empty();
             });
@@ -313,30 +320,87 @@ void BlockingConnectionAdapter::Start() {
                 break;
             }
         }
-        std::call_once(this->error_flag_, [this]() { this->error_callback_(this, "write failed"); });
+        std::call_once(this->error_flag_, [this]() { transport_->HandleError("write failed"); });
     });
 
     started_ = true;
+}
+
+void BlockingConnectionAdapter::StartReadThread() {
+    read_thread_ = std::thread([this]() {
+        LOG(INFO) << Serial() << ": read thread spawning";
+        while (true) {
+            auto packet = std::make_unique<apacket>();
+            if (!underlying_->Read(packet.get())) {
+                PLOG(INFO) << Serial() << ": read failed";
+                break;
+            }
+
+            bool got_stls_cmd = false;
+            if (packet->msg.command == A_STLS) {
+                got_stls_cmd = true;
+            }
+
+            transport_->HandleRead(std::move(packet));
+
+            // If we received the STLS packet, we are about to perform the TLS
+            // handshake. So this read thread must stop and resume after the
+            // handshake completes otherwise this will interfere in the process.
+            if (got_stls_cmd) {
+                LOG(INFO) << Serial() << ": Received STLS packet. Stopping read thread.";
+                return;
+            }
+        }
+        std::call_once(this->error_flag_, [this]() { transport_->HandleError("read failed"); });
+    });
+}
+
+bool BlockingConnectionAdapter::DoTlsHandshake(RSA* key, std::string* auth_key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (read_thread_.joinable()) {
+        read_thread_.join();
+    }
+    bool success = this->underlying_->DoTlsHandshake(key, auth_key);
+    StartReadThread();
+    return success;
+}
+
+void BlockingConnectionAdapter::Reset() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!started_) {
+            LOG(INFO) << "BlockingConnectionAdapter(" << Serial() << "): not started";
+            return;
+        }
+
+        if (stopped_) {
+            LOG(INFO) << "BlockingConnectionAdapter(" << Serial() << "): already stopped";
+            return;
+        }
+    }
+
+    LOG(INFO) << "BlockingConnectionAdapter(" << Serial() << "): resetting";
+    this->underlying_->Reset();
+    Stop();
 }
 
 void BlockingConnectionAdapter::Stop() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!started_) {
-            LOG(INFO) << "BlockingConnectionAdapter(" << this->transport_name_ << "): not started";
+            LOG(INFO) << "BlockingConnectionAdapter(" << Serial() << "): not started";
             return;
         }
 
         if (stopped_) {
-            LOG(INFO) << "BlockingConnectionAdapter(" << this->transport_name_
-                      << "): already stopped";
+            LOG(INFO) << "BlockingConnectionAdapter(" << Serial() << "): already stopped";
             return;
         }
 
         stopped_ = true;
     }
 
-    LOG(INFO) << "BlockingConnectionAdapter(" << this->transport_name_ << "): stopping";
+    LOG(INFO) << "BlockingConnectionAdapter(" << Serial() << "): stopping";
 
     this->underlying_->Close();
     this->cv_.notify_one();
@@ -354,8 +418,8 @@ void BlockingConnectionAdapter::Stop() {
     read_thread.join();
     write_thread.join();
 
-    LOG(INFO) << "BlockingConnectionAdapter(" << this->transport_name_ << "): stopped";
-    std::call_once(this->error_flag_, [this]() { this->error_callback_(this, "requested stop"); });
+    LOG(INFO) << "BlockingConnectionAdapter(" << Serial() << "): stopped";
+    std::call_once(this->error_flag_, [this]() { transport_->HandleError("requested stop"); });
 }
 
 bool BlockingConnectionAdapter::Write(std::unique_ptr<apacket> packet) {
@@ -368,8 +432,36 @@ bool BlockingConnectionAdapter::Write(std::unique_ptr<apacket> packet) {
     return true;
 }
 
+FdConnection::FdConnection(unique_fd fd) : fd_(std::move(fd)) {}
+
+FdConnection::~FdConnection() {}
+
+bool FdConnection::DispatchRead(void* buf, size_t len) {
+    if (tls_ != nullptr) {
+        // The TlsConnection doesn't allow 0 byte reads
+        if (len == 0) {
+            return true;
+        }
+        return tls_->ReadFully(buf, len);
+    }
+
+    return ReadFdExactly(fd_.get(), buf, len);
+}
+
+bool FdConnection::DispatchWrite(void* buf, size_t len) {
+    if (tls_ != nullptr) {
+        // The TlsConnection doesn't allow 0 byte writes
+        if (len == 0) {
+            return true;
+        }
+        return tls_->WriteFully(std::string_view(reinterpret_cast<const char*>(buf), len));
+    }
+
+    return WriteFdExactly(fd_.get(), buf, len);
+}
+
 bool FdConnection::Read(apacket* packet) {
-    if (!ReadFdExactly(fd_.get(), &packet->msg, sizeof(amessage))) {
+    if (!DispatchRead(&packet->msg, sizeof(amessage))) {
         D("remote local: read terminated (message)");
         return false;
     }
@@ -381,7 +473,7 @@ bool FdConnection::Read(apacket* packet) {
 
     packet->payload.resize(packet->msg.data_length);
 
-    if (!ReadFdExactly(fd_.get(), &packet->payload[0], packet->payload.size())) {
+    if (!DispatchRead(&packet->payload[0], packet->payload.size())) {
         D("remote local: terminated (data)");
         return false;
     }
@@ -390,13 +482,13 @@ bool FdConnection::Read(apacket* packet) {
 }
 
 bool FdConnection::Write(apacket* packet) {
-    if (!WriteFdExactly(fd_.get(), &packet->msg, sizeof(packet->msg))) {
+    if (!DispatchWrite(&packet->msg, sizeof(packet->msg))) {
         D("remote local: write terminated");
         return false;
     }
 
     if (packet->msg.data_length) {
-        if (!WriteFdExactly(fd_.get(), &packet->payload[0], packet->msg.data_length)) {
+        if (!DispatchWrite(&packet->payload[0], packet->msg.data_length)) {
             D("remote local: write terminated");
             return false;
         }
@@ -405,45 +497,55 @@ bool FdConnection::Write(apacket* packet) {
     return true;
 }
 
+bool FdConnection::DoTlsHandshake(RSA* key, std::string* auth_key) {
+    bssl::UniquePtr<EVP_PKEY> evp_pkey(EVP_PKEY_new());
+    if (!EVP_PKEY_set1_RSA(evp_pkey.get(), key)) {
+        LOG(ERROR) << "EVP_PKEY_set1_RSA failed";
+        return false;
+    }
+    auto x509 = GenerateX509Certificate(evp_pkey.get());
+    auto x509_str = X509ToPEMString(x509.get());
+    auto evp_str = Key::ToPEMString(evp_pkey.get());
+
+    int osh = cast_handle_to_int(adb_get_os_handle(fd_));
+#if ADB_HOST
+    tls_ = TlsConnection::Create(TlsConnection::Role::Client, x509_str, evp_str, osh);
+#else
+    tls_ = TlsConnection::Create(TlsConnection::Role::Server, x509_str, evp_str, osh);
+#endif
+    CHECK(tls_);
+#if ADB_HOST
+    // TLS 1.3 gives the client no message if the server rejected the
+    // certificate. This will enable a check in the tls connection to check
+    // whether the client certificate got rejected. Note that this assumes
+    // that, on handshake success, the server speaks first.
+    tls_->EnableClientPostHandshakeCheck(true);
+    // Add callback to set the certificate when server issues the
+    // CertificateRequest.
+    tls_->SetCertificateCallback(adb_tls_set_certificate);
+    // Allow any server certificate
+    tls_->SetCertVerifyCallback([](X509_STORE_CTX*) { return 1; });
+#else
+    // Add callback to check certificate against a list of known public keys
+    tls_->SetCertVerifyCallback(
+            [auth_key](X509_STORE_CTX* ctx) { return adbd_tls_verify_cert(ctx, auth_key); });
+    // Add the list of allowed client CA issuers
+    auto ca_list = adbd_tls_client_ca_list();
+    tls_->SetClientCAList(ca_list.get());
+#endif
+
+    auto err = tls_->DoHandshake();
+    if (err == TlsError::Success) {
+        return true;
+    }
+
+    tls_.reset();
+    return false;
+}
+
 void FdConnection::Close() {
     adb_shutdown(fd_.get());
     fd_.reset();
-}
-
-static std::string dump_packet(const char* name, const char* func, apacket* p) {
-    unsigned command = p->msg.command;
-    int len = p->msg.data_length;
-    char cmd[9];
-    char arg0[12], arg1[12];
-    int n;
-
-    for (n = 0; n < 4; n++) {
-        int b = (command >> (n * 8)) & 255;
-        if (b < 32 || b >= 127) break;
-        cmd[n] = (char)b;
-    }
-    if (n == 4) {
-        cmd[4] = 0;
-    } else {
-        /* There is some non-ASCII name in the command, so dump
-            * the hexadecimal value instead */
-        snprintf(cmd, sizeof cmd, "%08x", command);
-    }
-
-    if (p->msg.arg0 < 256U)
-        snprintf(arg0, sizeof arg0, "%d", p->msg.arg0);
-    else
-        snprintf(arg0, sizeof arg0, "0x%x", p->msg.arg0);
-
-    if (p->msg.arg1 < 256U)
-        snprintf(arg1, sizeof arg1, "%d", p->msg.arg1);
-    else
-        snprintf(arg1, sizeof arg1, "0x%x", p->msg.arg1);
-
-    std::string result = android::base::StringPrintf("%s: %s: [%s] arg0=%s arg1=%s (len=%d) ", name,
-                                                     func, cmd, arg0, arg1, len);
-    result += dump_hex(p->payload.data(), p->payload.size());
-    return result;
 }
 
 void send_packet(apacket* p, atransport* t) {
@@ -458,7 +560,7 @@ void send_packet(apacket* p, atransport* t) {
     VLOG(TRANSPORT) << dump_packet(t->serial.c_str(), "to remote", p);
 
     if (t == nullptr) {
-        fatal("Transport is null");
+        LOG(FATAL) << "Transport is null";
     }
 
     if (t->Write(p) != 0) {
@@ -467,14 +569,18 @@ void send_packet(apacket* p, atransport* t) {
     }
 }
 
-void kick_transport(atransport* t) {
+void kick_transport(atransport* t, bool reset) {
     std::lock_guard<std::recursive_mutex> lock(transport_lock);
     // As kick_transport() can be called from threads without guarantee that t is valid,
     // check if the transport is in transport_list first.
     //
     // TODO(jmgao): WTF? Is this actually true?
     if (std::find(transport_list.begin(), transport_list.end(), t) != transport_list.end()) {
-        t->Kick();
+        if (reset) {
+            t->Reset();
+        } else {
+            t->Kick();
+        }
     }
 
 #if ADB_HOST
@@ -556,15 +662,13 @@ static void device_tracker_ready(asocket* socket) {
     // for the first time, even if no update occurred.
     if (tracker->update_needed) {
         tracker->update_needed = false;
-
-        std::string transports = list_transports(tracker->long_output);
-        device_tracker_send(tracker, transports);
+        device_tracker_send(tracker, list_transports(tracker->long_output));
     }
 }
 
 asocket* create_device_tracker(bool long_output) {
     device_tracker* tracker = new device_tracker();
-    if (tracker == nullptr) fatal("cannot allocate device tracker");
+    if (tracker == nullptr) LOG(FATAL) << "cannot allocate device tracker";
 
     D("device tracker %p created", tracker);
 
@@ -601,13 +705,11 @@ void update_transports() {
     update_transport_status();
 
     // Notify `adb track-devices` clients.
-    std::string transports = list_transports(false);
-
     device_tracker* tracker = device_tracker_list;
     while (tracker != nullptr) {
         device_tracker* next = tracker->next;
         // This may destroy the tracker if the connection is closed.
-        device_tracker_send(tracker, transports);
+        device_tracker_send(tracker, list_transports(tracker->long_output));
         tracker = next;
     }
 }
@@ -661,6 +763,16 @@ static int transport_write_action(int fd, struct tmsg* m) {
     return 0;
 }
 
+static bool usb_devices_start_detached() {
+#if ADB_HOST
+    static const char* env = getenv("ADB_LIBUSB_START_DETACHED");
+    static bool result = env && strcmp("1", env) == 0;
+    return should_use_libusb() && result;
+#else
+    return false;
+#endif
+}
+
 static void transport_registration_func(int _fd, unsigned ev, void*) {
     tmsg m;
     atransport* t;
@@ -670,7 +782,7 @@ static void transport_registration_func(int _fd, unsigned ev, void*) {
     }
 
     if (transport_read_action(_fd, &m)) {
-        fatal_errno("cannot read transport registration socket");
+        PLOG(FATAL) << "cannot read transport registration socket";
     }
 
     t = m.transport;
@@ -691,35 +803,16 @@ static void transport_registration_func(int _fd, unsigned ev, void*) {
 
     /* don't create transport threads for inaccessible devices */
     if (t->GetConnectionState() != kCsNoPerm) {
-        // The connection gets a reference to the atransport. It will release it
-        // upon a read/write error.
-        t->ref_count++;
-        t->connection()->SetTransportName(t->serial_name());
-        t->connection()->SetReadCallback([t](Connection*, std::unique_ptr<apacket> p) {
-            if (!check_header(p.get(), t)) {
-                D("%s: remote read: bad header", t->serial.c_str());
-                return false;
-            }
+        t->connection()->SetTransport(t);
 
-            VLOG(TRANSPORT) << dump_packet(t->serial.c_str(), "from remote", p.get());
-            apacket* packet = p.release();
-
-            // TODO: Does this need to run on the main thread?
-            fdevent_run_on_main_thread([packet, t]() { handle_packet(packet, t); });
-            return true;
-        });
-        t->connection()->SetErrorCallback([t](Connection*, const std::string& error) {
-            D("%s: connection terminated: %s", t->serial.c_str(), error.c_str());
-            fdevent_run_on_main_thread([t]() {
-                handle_offline(t);
-                transport_unref(t);
-            });
-        });
-
-        t->connection()->Start();
+        if (t->type == kTransportUsb && usb_devices_start_detached()) {
+            t->SetConnectionState(kCsDetached);
+        } else {
+            t->connection()->Start();
 #if ADB_HOST
-        send_connect(t);
+            send_connect(t);
 #endif
+        }
     }
 
     {
@@ -744,7 +837,7 @@ void init_transport_registration(void) {
     int s[2];
 
     if (adb_socketpair(s)) {
-        fatal_errno("cannot open transport registration socketpair");
+        PLOG(FATAL) << "cannot open transport registration socketpair";
     }
     D("socketpair: (%d,%d)", s[0], s[1]);
 
@@ -752,7 +845,7 @@ void init_transport_registration(void) {
     transport_registration_recv = s[1];
 
     transport_registration_fde =
-        fdevent_create(transport_registration_recv, transport_registration_func, nullptr);
+            fdevent_create(transport_registration_recv, transport_registration_func, nullptr);
     fdevent_set(transport_registration_fde, FDE_READ);
 }
 
@@ -767,14 +860,34 @@ void kick_all_transports() {
     }
 }
 
+void kick_all_tcp_tls_transports() {
+    std::lock_guard<std::recursive_mutex> lock(transport_lock);
+    for (auto t : transport_list) {
+        if (t->IsTcpDevice() && t->use_tls) {
+            t->Kick();
+        }
+    }
+}
+
+#if !ADB_HOST
+void kick_all_transports_by_auth_key(std::string_view auth_key) {
+    std::lock_guard<std::recursive_mutex> lock(transport_lock);
+    for (auto t : transport_list) {
+        if (auth_key == t->auth_key) {
+            t->Kick();
+        }
+    }
+}
+#endif
+
 /* the fdevent select pump is single threaded */
-static void register_transport(atransport* transport) {
+void register_transport(atransport* transport) {
     tmsg m;
     m.transport = transport;
     m.action = 1;
     D("transport: %s registered", transport->serial.c_str());
     if (transport_write_action(transport_registration_send, &m)) {
-        fatal_errno("cannot write transport registration socket\n");
+        PLOG(FATAL) << "cannot write transport registration socket";
     }
 }
 
@@ -784,37 +897,34 @@ static void remove_transport(atransport* transport) {
     m.action = 0;
     D("transport: %s removed", transport->serial.c_str());
     if (transport_write_action(transport_registration_send, &m)) {
-        fatal_errno("cannot write transport registration socket\n");
+        PLOG(FATAL) << "cannot write transport registration socket";
     }
 }
 
-static void transport_unref(atransport* t) {
+static void transport_destroy(atransport* t) {
     check_main_thread();
     CHECK(t != nullptr);
 
     std::lock_guard<std::recursive_mutex> lock(transport_lock);
-    CHECK_GT(t->ref_count, 0u);
-    t->ref_count--;
-    if (t->ref_count == 0) {
-        t->connection()->Stop();
+    LOG(INFO) << "destroying transport " << t->serial_name();
+    t->connection()->Stop();
 #if ADB_HOST
-        if (t->IsTcpDevice() && !t->kicked()) {
-            D("transport: %s unref (attempting reconnection)", t->serial.c_str());
-            reconnect_handler.TrackTransport(t);
-        } else {
-            D("transport: %s unref (kicking and closing)", t->serial.c_str());
-            remove_transport(t);
-        }
-#else
-        D("transport: %s unref (kicking and closing)", t->serial.c_str());
-        remove_transport(t);
+    if (t->IsTcpDevice() && !t->kicked()) {
+        D("transport: %s destroy (attempting reconnection)", t->serial.c_str());
+
+        // We need to clear the transport's keys, so that on the next connection, it tries
+        // again from the beginning.
+        t->ResetKeys();
+        reconnect_handler.TrackTransport(t);
+        return;
+    }
 #endif
 
-    } else {
-        D("transport: %s unref (count=%zu)", t->serial.c_str(), t->ref_count);
-    }
+    D("transport: %s destroy (kicking and closing)", t->serial.c_str());
+    remove_transport(t);
 }
 
+#if ADB_HOST
 static int qual_match(const std::string& to_test, const char* prefix, const std::string& qual,
                       bool sanitize_qual) {
     if (to_test.empty()) /* Return true if both the qual and to_test are empty strings. */
@@ -844,8 +954,8 @@ atransport* acquire_one_transport(TransportType type, const char* serial, Transp
     atransport* result = nullptr;
 
     if (transport_id != 0) {
-        *error_out =
-            android::base::StringPrintf("no device with transport id '%" PRIu64 "'", transport_id);
+        *error_out = android::base::StringPrintf("no device with transport id '%" PRIu64 "'",
+                                                 transport_id);
     } else if (serial) {
         *error_out = android::base::StringPrintf("device '%s' not found", serial);
     } else if (type == kTransportLocal) {
@@ -954,7 +1064,7 @@ atransport* acquire_one_transport(TransportType type, const char* serial, Transp
 
 bool ConnectionWaitable::WaitForConnection(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    ScopedAssumeLocked assume_locked(mutex_);
+    ScopedLockAssertion assume_locked(mutex_);
     return cv_.wait_for(lock, timeout, [&]() REQUIRES(mutex_) {
         return connection_established_ready_;
     }) && connection_established_;
@@ -970,19 +1080,29 @@ void ConnectionWaitable::SetConnectionEstablished(bool success) {
     }
     cv_.notify_one();
 }
+#endif
 
 atransport::~atransport() {
+#if ADB_HOST
     // If the connection callback had not been run before, run it now.
     SetConnectionEstablished(false);
+#endif
 }
 
 int atransport::Write(apacket* p) {
     return this->connection()->Write(std::unique_ptr<apacket>(p)) ? 0 : -1;
 }
 
+void atransport::Reset() {
+    if (!kicked_.exchange(true)) {
+        LOG(INFO) << "resetting transport " << this << " " << this->serial;
+        this->connection()->Reset();
+    }
+}
+
 void atransport::Kick() {
     if (!kicked_.exchange(true)) {
-        D("kicking transport %p %s", this, this->serial.c_str());
+        LOG(INFO) << "kicking transport " << this << " " << this->serial;
         this->connection()->Stop();
     }
 }
@@ -994,39 +1114,90 @@ ConnectionState atransport::GetConnectionState() const {
 void atransport::SetConnectionState(ConnectionState state) {
     check_main_thread();
     connection_state_ = state;
+    update_transports();
 }
 
-void atransport::SetConnection(std::unique_ptr<Connection> connection) {
+#if ADB_HOST
+bool atransport::Attach(std::string* error) {
+    D("%s: attach", serial.c_str());
+    check_main_thread();
+
+    if (!should_use_libusb()) {
+        *error = "attach/detach only implemented for libusb backend";
+        return false;
+    }
+
+    if (GetConnectionState() != ConnectionState::kCsDetached) {
+        *error = android::base::StringPrintf("transport %s is not detached", serial.c_str());
+        return false;
+    }
+
+    ResetKeys();
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!connection_->Attach(error)) {
+            return false;
+        }
+    }
+
+    send_connect(this);
+    return true;
+}
+
+bool atransport::Detach(std::string* error) {
+    D("%s: detach", serial.c_str());
+    check_main_thread();
+
+    if (!should_use_libusb()) {
+        *error = "attach/detach only implemented for libusb backend";
+        return false;
+    }
+
+    if (GetConnectionState() == ConnectionState::kCsDetached) {
+        *error = android::base::StringPrintf("transport %s is already detached", serial.c_str());
+        return false;
+    }
+
+    handle_offline(this);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!connection_->Detach(error)) {
+            return false;
+        }
+    }
+
+    this->SetConnectionState(kCsDetached);
+    return true;
+}
+#endif
+
+void atransport::SetConnection(std::shared_ptr<Connection> connection) {
     std::lock_guard<std::mutex> lock(mutex_);
     connection_ = std::shared_ptr<Connection>(std::move(connection));
 }
 
-std::string atransport::connection_state_name() const {
-    ConnectionState state = GetConnectionState();
-    switch (state) {
-        case kCsOffline:
-            return "offline";
-        case kCsBootloader:
-            return "bootloader";
-        case kCsDevice:
-            return "device";
-        case kCsHost:
-            return "host";
-        case kCsRecovery:
-            return "recovery";
-        case kCsNoPerm:
-            return UsbNoPermissionsShortHelpText();
-        case kCsSideload:
-            return "sideload";
-        case kCsUnauthorized:
-            return "unauthorized";
-        case kCsAuthorizing:
-            return "authorizing";
-        case kCsConnecting:
-            return "connecting";
-        default:
-            return "unknown";
+bool atransport::HandleRead(std::unique_ptr<apacket> p) {
+    if (!check_header(p.get(), this)) {
+        D("%s: remote read: bad header", serial.c_str());
+        return false;
     }
+
+    VLOG(TRANSPORT) << dump_packet(serial.c_str(), "from remote", p.get());
+    apacket* packet = p.release();
+
+    // TODO: Does this need to run on the main thread?
+    fdevent_run_on_main_thread([packet, this]() { handle_packet(packet, this); });
+    return true;
+}
+
+void atransport::HandleError(const std::string& error) {
+    LOG(INFO) << serial_name() << ": connection terminated: " << error;
+    fdevent_run_on_main_thread([this]() {
+        handle_offline(this);
+        transport_destroy(this);
+    });
 }
 
 void atransport::update_version(int version, size_t payload) {
@@ -1038,18 +1209,40 @@ int atransport::get_protocol_version() const {
     return protocol_version;
 }
 
+int atransport::get_tls_version() const {
+    return tls_version;
+}
+
 size_t atransport::get_max_payload() const {
     return max_payload;
 }
 
 const FeatureSet& supported_features() {
-    // Local static allocation to avoid global non-POD variables.
-    static const FeatureSet* features = new FeatureSet{
-        kFeatureShell2, kFeatureCmd, kFeatureStat2,
-        // Increment ADB_SERVER_VERSION whenever the feature list changes to
-        // make sure that the adb client and server features stay in sync
-        // (http://b/24370690).
-    };
+    static const android::base::NoDestructor<FeatureSet> features([] {
+        return FeatureSet{
+                kFeatureShell2,
+                kFeatureCmd,
+                kFeatureStat2,
+                kFeatureLs2,
+                kFeatureFixedPushMkdir,
+                kFeatureApex,
+                kFeatureAbb,
+                kFeatureFixedPushSymlinkTimestamp,
+                kFeatureAbbExec,
+                kFeatureRemountShell,
+                kFeatureTrackApp,
+                kFeatureSendRecv2,
+                kFeatureSendRecv2Brotli,
+                kFeatureSendRecv2LZ4,
+                kFeatureSendRecv2Zstd,
+                kFeatureSendRecv2DryRunSend,
+                kFeatureOpenscreenMdns,
+                // Increment ADB_SERVER_VERSION when adding a feature that adbd needs
+                // to know about. Otherwise, the client can be stuck running an old
+                // version of the server even after upgrading their copy of adb.
+                // (http://b/24370690)
+        };
+    }());
 
     return *features;
 }
@@ -1063,16 +1256,20 @@ FeatureSet StringToFeatureSet(const std::string& features_string) {
         return FeatureSet();
     }
 
-    auto names = android::base::Split(features_string, ",");
-    return FeatureSet(names.begin(), names.end());
+    return android::base::Split(features_string, ",");
+}
+
+template <class Range, class Value>
+static bool contains(const Range& r, const Value& v) {
+    return std::find(std::begin(r), std::end(r), v) != std::end(r);
 }
 
 bool CanUseFeature(const FeatureSet& feature_set, const std::string& feature) {
-    return feature_set.count(feature) > 0 && supported_features().count(feature) > 0;
+    return contains(feature_set, feature) && contains(supported_features(), feature);
 }
 
 bool atransport::has_feature(const std::string& feature) const {
-    return features_.count(feature) > 0;
+    return contains(features_, feature);
 }
 
 void atransport::SetFeatures(const std::string& features_string) {
@@ -1094,6 +1291,7 @@ void atransport::RunDisconnects() {
     disconnects_.clear();
 }
 
+#if ADB_HOST
 bool atransport::MatchesTarget(const std::string& target) const {
     if (!serial.empty()) {
         if (target == serial) {
@@ -1111,7 +1309,8 @@ bool atransport::MatchesTarget(const std::string& target) const {
             // Parse our |serial| and the given |target| to check if the hostnames and ports match.
             std::string serial_host, error;
             int serial_port = -1;
-            if (android::base::ParseNetAddress(serial, &serial_host, &serial_port, nullptr, &error)) {
+            if (android::base::ParseNetAddress(serial, &serial_host, &serial_port, nullptr,
+                                               &error)) {
                 // |target| may omit the port to default to ours.
                 std::string target_host;
                 int target_port = serial_port;
@@ -1136,8 +1335,6 @@ void atransport::SetConnectionEstablished(bool success) {
 ReconnectResult atransport::Reconnect() {
     return reconnect_(this);
 }
-
-#if ADB_HOST
 
 // We use newline as our delimiter, make sure to never output it.
 static std::string sanitize(std::string str, bool alphanumeric) {
@@ -1167,10 +1364,10 @@ static void append_transport(const atransport* t, std::string* result, bool long
     if (!long_listing) {
         *result += serial;
         *result += '\t';
-        *result += t->connection_state_name();
+        *result += to_string(t->GetConnectionState());
     } else {
         android::base::StringAppendF(result, "%-22s %s", serial.c_str(),
-                                     t->connection_state_name().c_str());
+                                     to_string(t->GetConnectionState()).c_str());
 
         append_transport_info(result, "", t->devpath, false);
         append_transport_info(result, "product:", t->product, false);
@@ -1203,24 +1400,29 @@ std::string list_transports(bool long_listing) {
     return result;
 }
 
-void close_usb_devices(std::function<bool(const atransport*)> predicate) {
+void close_usb_devices(std::function<bool(const atransport*)> predicate, bool reset) {
     std::lock_guard<std::recursive_mutex> lock(transport_lock);
     for (auto& t : transport_list) {
         if (predicate(t)) {
-            t->Kick();
+            if (reset) {
+                t->Reset();
+            } else {
+                t->Kick();
+            }
         }
     }
 }
 
 /* hack for osx */
-void close_usb_devices() {
-    close_usb_devices([](const atransport*) { return true; });
+void close_usb_devices(bool reset) {
+    close_usb_devices([](const atransport*) { return true; }, reset);
 }
-#endif  // ADB_HOST
+#endif
 
 bool register_socket_transport(unique_fd s, std::string serial, int port, int local,
-                               atransport::ReconnectCallback reconnect, int* error) {
+                               atransport::ReconnectCallback reconnect, bool use_tls, int* error) {
     atransport* t = new atransport(std::move(reconnect), kCsOffline);
+    t->use_tls = use_tls;
 
     D("transport: %s init'ing for socket %d, on port %d", serial.c_str(), s.get(), port);
     if (init_socket_transport(t, std::move(s), port, local) < 0) {
@@ -1255,7 +1457,9 @@ bool register_socket_transport(unique_fd s, std::string serial, int port, int lo
 
     lock.unlock();
 
+#if ADB_HOST
     auto waitable = t->connection_waitable();
+#endif
     register_transport(t);
 
     if (local == 1) {
@@ -1263,6 +1467,7 @@ bool register_socket_transport(unique_fd s, std::string serial, int port, int lo
         return true;
     }
 
+#if ADB_HOST
     if (!waitable->WaitForConnection(std::chrono::seconds(10))) {
         if (error) *error = ETIMEDOUT;
         return false;
@@ -1272,6 +1477,7 @@ bool register_socket_transport(unique_fd s, std::string serial, int port, int lo
         if (error) *error = EPERM;
         return false;
     }
+#endif
 
     return true;
 }
@@ -1302,12 +1508,29 @@ void kick_all_tcp_devices() {
             t->Kick();
         }
     }
-#if ADB_HOST
     reconnect_handler.CheckForKicked();
-#endif
 }
 
-#endif
+void register_usb_transport(std::shared_ptr<Connection> connection, const char* serial,
+                            const char* devpath, unsigned writeable) {
+    atransport* t = new atransport(writeable ? kCsOffline : kCsNoPerm);
+    if (serial) {
+        t->serial = serial;
+    }
+    if (devpath) {
+        t->devpath = devpath;
+    }
+
+    t->SetConnection(std::move(connection));
+    t->type = kTransportUsb;
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(transport_lock);
+        pending_list.push_front(t);
+    }
+
+    register_transport(t);
+}
 
 void register_usb_transport(usb_handle* usb, const char* serial, const char* devpath,
                             unsigned writeable) {
@@ -1335,13 +1558,10 @@ void register_usb_transport(usb_handle* usb, const char* serial, const char* dev
 void unregister_usb_transport(usb_handle* usb) {
     std::lock_guard<std::recursive_mutex> lock(transport_lock);
     transport_list.remove_if([usb](atransport* t) {
-        auto connection = t->connection();
-        if (auto usb_connection = dynamic_cast<UsbConnection*>(connection.get())) {
-            return usb_connection->handle_ == usb && t->GetConnectionState() == kCsNoPerm;
-        }
-        return false;
+        return t->GetUsbHandle() == usb && t->GetConnectionState() == kCsNoPerm;
     });
 }
+#endif
 
 bool check_header(apacket* p, atransport* t) {
     if (p->msg.magic != (p->msg.command ^ 0xffffffff)) {
@@ -1360,11 +1580,30 @@ bool check_header(apacket* p, atransport* t) {
 }
 
 #if ADB_HOST
-std::shared_ptr<RSA> atransport::NextKey() {
-    if (keys_.empty()) keys_ = adb_auth_get_private_keys();
+std::shared_ptr<RSA> atransport::Key() {
+    if (keys_.empty()) {
+        return nullptr;
+    }
 
     std::shared_ptr<RSA> result = keys_[0];
-    keys_.pop_front();
     return result;
+}
+
+std::shared_ptr<RSA> atransport::NextKey() {
+    if (keys_.empty()) {
+        LOG(INFO) << "fetching keys for transport " << this->serial_name();
+        keys_ = adb_auth_get_private_keys();
+
+        // We should have gotten at least one key: the one that's automatically generated.
+        CHECK(!keys_.empty());
+    } else {
+        keys_.pop_front();
+    }
+
+    return Key();
+}
+
+void atransport::ResetKeys() {
+    keys_.clear();
 }
 #endif

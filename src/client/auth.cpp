@@ -29,6 +29,10 @@
 #include <set>
 #include <string>
 
+#include <adb/crypto/rsa_2048_key.h>
+#include <adb/crypto/x509_generator.h>
+#include <adb/tls/adb_ca_list.h>
+#include <adb/tls/tls_connection.h>
 #include <android-base/errors.h>
 #include <android-base/file.h>
 #include <android-base/stringprintf.h>
@@ -43,6 +47,7 @@
 
 #include "adb.h"
 #include "adb_auth.h"
+#include "adb_io.h"
 #include "adb_utils.h"
 #include "sysdeps.h"
 #include "transport.h"
@@ -52,107 +57,51 @@ static std::map<std::string, std::shared_ptr<RSA>>& g_keys =
     *new std::map<std::string, std::shared_ptr<RSA>>;
 static std::map<int, std::string>& g_monitored_paths = *new std::map<int, std::string>;
 
-static std::string get_user_info() {
-    LOG(INFO) << "get_user_info...";
+using namespace adb::crypto;
+using namespace adb::tls;
 
-    std::string hostname;
-    if (getenv("HOSTNAME")) hostname = getenv("HOSTNAME");
-#if !defined(_WIN32)
-    char buf[64];
-    if (hostname.empty() && gethostname(buf, sizeof(buf)) != -1) hostname = buf;
-#endif
-    if (hostname.empty()) hostname = "unknown";
-
-    std::string username;
-    if (getenv("LOGNAME")) username = getenv("LOGNAME");
-#if !defined _WIN32 && !defined ADB_HOST_ON_TARGET
-    if (username.empty() && getlogin()) username = getlogin();
-#endif
-    if (username.empty()) hostname = "unknown";
-
-    return " " + username + "@" + hostname;
-}
-
-static bool write_public_keyfile(RSA* private_key, const std::string& private_key_path) {
-    LOG(INFO) << "write_public_keyfile...";
-
-    uint8_t binary_key_data[ANDROID_PUBKEY_ENCODED_SIZE];
-    if (!android_pubkey_encode(private_key, binary_key_data, sizeof(binary_key_data))) {
-        LOG(ERROR) << "Failed to convert to public key";
-        return false;
-    }
-
-    size_t expected_length;
-    if (!EVP_EncodedLength(&expected_length, sizeof(binary_key_data))) {
-        LOG(ERROR) << "Public key too large to base64 encode";
-        return false;
-    }
-
-    std::string content;
-    content.resize(expected_length);
-    size_t actual_length = EVP_EncodeBlock(reinterpret_cast<uint8_t*>(&content[0]), binary_key_data,
-                                           sizeof(binary_key_data));
-    content.resize(actual_length);
-
-    content += get_user_info();
-
-    std::string path(private_key_path + ".pub");
-    if (!android::base::WriteStringToFile(content, path)) {
-        PLOG(ERROR) << "Failed to write public key to '" << path << "'";
-        return false;
-    }
-
-    return true;
-}
-
-static int generate_key(const std::string& file) {
+static bool generate_key(const std::string& file) {
     LOG(INFO) << "generate_key(" << file << ")...";
 
-    mode_t old_mask;
-    FILE *f = nullptr;
-    int ret = 0;
+    auto rsa_2048 = CreateRSA2048Key();
+    if (!rsa_2048) {
+        LOG(ERROR) << "Unable to create key";
+        return false;
+    }
+    std::string pubkey;
 
-    EVP_PKEY* pkey = EVP_PKEY_new();
-    BIGNUM* exponent = BN_new();
-    RSA* rsa = RSA_new();
-    if (!pkey || !exponent || !rsa) {
-        LOG(ERROR) << "Failed to allocate key";
-        goto out;
+    RSA* rsa = EVP_PKEY_get0_RSA(rsa_2048->GetEvpPkey());
+    CHECK(rsa);
+
+    if (!CalculatePublicKey(&pubkey, rsa)) {
+        LOG(ERROR) << "failed to calculate public key";
+        return false;
     }
 
-    BN_set_word(exponent, RSA_F4);
-    RSA_generate_key_ex(rsa, 2048, exponent, nullptr);
-    EVP_PKEY_set1_RSA(pkey, rsa);
+    mode_t old_mask = umask(077);
 
-    old_mask = umask(077);
-
-    f = fopen(file.c_str(), "w");
+    std::unique_ptr<FILE, decltype(&fclose)> f(nullptr, &fclose);
+    f.reset(fopen(file.c_str(), "w"));
     if (!f) {
         PLOG(ERROR) << "Failed to open " << file;
         umask(old_mask);
-        goto out;
+        return false;
     }
 
     umask(old_mask);
 
-    if (!PEM_write_PrivateKey(f, pkey, nullptr, nullptr, 0, nullptr, nullptr)) {
-        D("Failed to write key");
-        goto out;
+    if (!PEM_write_PrivateKey(f.get(), rsa_2048->GetEvpPkey(), nullptr, nullptr, 0, nullptr,
+                              nullptr)) {
+        LOG(ERROR) << "Failed to write key";
+        return false;
     }
 
-    if (!write_public_keyfile(rsa, file)) {
-        D("Failed to write public key");
-        goto out;
+    if (!android::base::WriteStringToFile(pubkey, file + ".pub")) {
+        PLOG(ERROR) << "failed to write public key";
+        return false;
     }
 
-    ret = 1;
-
-out:
-    if (f) fclose(f);
-    EVP_PKEY_free(pkey);
-    RSA_free(rsa);
-    BN_free(exponent);
-    return ret;
+    return true;
 }
 
 static std::string hash_key(RSA* key) {
@@ -170,56 +119,65 @@ static std::string hash_key(RSA* key) {
     return result;
 }
 
-static bool read_key_file(const std::string& file) {
-    LOG(INFO) << "read_key_file '" << file << "'...";
-
+static std::shared_ptr<RSA> read_key_file(const std::string& file) {
     std::unique_ptr<FILE, decltype(&fclose)> fp(fopen(file.c_str(), "r"), fclose);
     if (!fp) {
         PLOG(ERROR) << "Failed to open '" << file << "'";
-        return false;
+        return nullptr;
     }
 
     RSA* key = RSA_new();
     if (!PEM_read_RSAPrivateKey(fp.get(), &key, nullptr, nullptr)) {
-        LOG(ERROR) << "Failed to read key";
+        LOG(ERROR) << "Failed to read key from '" << file << "'";
+        ERR_print_errors_fp(stderr);
         RSA_free(key);
+        return nullptr;
+    }
+
+    return std::shared_ptr<RSA>(key, RSA_free);
+}
+
+static bool load_key(const std::string& file) {
+    std::shared_ptr<RSA> key = read_key_file(file);
+    if (!key) {
         return false;
     }
 
     std::lock_guard<std::mutex> lock(g_keys_mutex);
-    std::string fingerprint = hash_key(key);
-    if (g_keys.find(fingerprint) != g_keys.end()) {
-        LOG(INFO) << "ignoring already-loaded key: " << file;
-        RSA_free(key);
-    } else {
-        g_keys[fingerprint] = std::shared_ptr<RSA>(key, RSA_free);
+    std::string fingerprint = hash_key(key.get());
+    bool already_loaded = (g_keys.find(fingerprint) != g_keys.end());
+    if (!already_loaded) {
+        g_keys[fingerprint] = std::move(key);
     }
-
+    LOG(INFO) << (already_loaded ? "ignored already-loaded" : "loaded new") << " key from '" << file
+              << "' with fingerprint " << SHA256BitsToHexString(fingerprint);
     return true;
 }
 
-static bool read_keys(const std::string& path, bool allow_dir = true) {
-    LOG(INFO) << "read_keys '" << path << "'...";
+static bool load_keys(const std::string& path, bool allow_dir = true) {
+    LOG(INFO) << "load_keys '" << path << "'...";
 
     struct stat st;
     if (stat(path.c_str(), &st) != 0) {
-        PLOG(ERROR) << "failed to stat '" << path << "'";
+        PLOG(ERROR) << "load_keys: failed to stat '" << path << "'";
         return false;
     }
 
     if (S_ISREG(st.st_mode)) {
-        return read_key_file(path);
-    } else if (S_ISDIR(st.st_mode)) {
+        return load_key(path);
+    }
+
+    if (S_ISDIR(st.st_mode)) {
         if (!allow_dir) {
             // inotify isn't recursive. It would break expectations to load keys in nested
             // directories but not monitor them for new keys.
-            LOG(WARNING) << "refusing to recurse into directory '" << path << "'";
+            LOG(WARNING) << "load_keys: refusing to recurse into directory '" << path << "'";
             return false;
         }
 
         std::unique_ptr<DIR, decltype(&closedir)> dir(opendir(path.c_str()), closedir);
         if (!dir) {
-            PLOG(ERROR) << "failed to open directory '" << path << "'";
+            PLOG(ERROR) << "load_keys: failed to open directory '" << path << "'";
             return false;
         }
 
@@ -233,16 +191,16 @@ static bool read_keys(const std::string& path, bool allow_dir = true) {
             }
 
             if (!android::base::EndsWith(name, ".adb_key")) {
-                LOG(INFO) << "skipping non-adb_key '" << path << "/" << name << "'";
+                LOG(INFO) << "skipped non-adb_key '" << path << "/" << name << "'";
                 continue;
             }
 
-            result |= read_key_file((path + OS_PATH_SEPARATOR + name));
+            result |= load_key((path + OS_PATH_SEPARATOR + name));
         }
         return result;
     }
 
-    LOG(ERROR) << "unexpected type for '" << path << "': 0x" << std::hex << st.st_mode;
+    LOG(ERROR) << "load_keys: unexpected type for '" << path << "': 0x" << std::hex << st.st_mode;
     return false;
 }
 
@@ -250,7 +208,7 @@ static std::string get_user_key_path() {
     return adb_get_android_dir_path() + OS_PATH_SEPARATOR + "adbkey";
 }
 
-static bool get_user_key() {
+static bool load_userkey() {
     std::string path = get_user_key_path();
     if (path.empty()) {
         PLOG(ERROR) << "Error getting user key filename";
@@ -266,7 +224,7 @@ static bool get_user_key() {
         }
     }
 
-    return read_key_file(path);
+    return load_key(path);
 }
 
 static std::set<std::string> get_vendor_keys() {
@@ -320,24 +278,62 @@ static std::string adb_auth_sign(RSA* key, const char* token, size_t token_size)
     return result;
 }
 
+static bool pubkey_from_privkey(std::string* out, const std::string& path) {
+    std::shared_ptr<RSA> privkey = read_key_file(path);
+    if (!privkey) {
+        return false;
+    }
+    return CalculatePublicKey(out, privkey.get());
+}
+
+bssl::UniquePtr<EVP_PKEY> adb_auth_get_user_privkey() {
+    std::string path = get_user_key_path();
+    if (path.empty()) {
+        PLOG(ERROR) << "Error getting user key filename";
+        return nullptr;
+    }
+
+    std::shared_ptr<RSA> rsa_privkey = read_key_file(path);
+    if (!rsa_privkey) {
+        return nullptr;
+    }
+
+    bssl::UniquePtr<EVP_PKEY> pkey(EVP_PKEY_new());
+    if (!pkey) {
+        LOG(ERROR) << "Failed to allocate key";
+        return nullptr;
+    }
+
+    EVP_PKEY_set1_RSA(pkey.get(), rsa_privkey.get());
+    return pkey;
+}
+
 std::string adb_auth_get_userkey() {
     std::string path = get_user_key_path();
     if (path.empty()) {
         PLOG(ERROR) << "Error getting user key filename";
         return "";
     }
-    path += ".pub";
 
-    std::string content;
-    if (!android::base::ReadFileToString(path, &content)) {
-        PLOG(ERROR) << "Can't load '" << path << "'";
+    std::string result;
+    if (!pubkey_from_privkey(&result, path)) {
         return "";
     }
-    return content;
+    return result;
 }
 
 int adb_auth_keygen(const char* filename) {
-    return (generate_key(filename) == 0);
+    return !generate_key(filename);
+}
+
+int adb_auth_pubkey(const char* filename) {
+    std::string pubkey;
+    if (!pubkey_from_privkey(&pubkey, filename)) {
+        return 1;
+    }
+    pubkey.push_back('\n');
+
+    return WriteFdExactly(STDOUT_FILENO, pubkey.data(), pubkey.size()) ? 0 : 1;
 }
 
 #if defined(__linux__)
@@ -380,7 +376,7 @@ static void adb_auth_inotify_update(int fd, unsigned fd_event, void*) {
                     LOG(INFO) << "ignoring new directory at '" << path << "'";
                 } else {
                     LOG(INFO) << "observed new file at '" << path << "'";
-                    read_keys(path, false);
+                    load_keys(path, false);
                 }
             } else {
                 LOG(WARNING) << "unmonitored event for " << path << ": 0x" << std::hex
@@ -404,12 +400,12 @@ static void adb_auth_inotify_init(const std::set<std::string>& paths) {
     for (const std::string& path : paths) {
         int wd = inotify_add_watch(infd, path.c_str(), IN_CREATE | IN_MOVED_TO);
         if (wd < 0) {
-            PLOG(ERROR) << "failed to inotify_add_watch on path '" << path;
+            PLOG(ERROR) << "failed to inotify_add_watch on path '" << path << "'";
             continue;
         }
 
         g_monitored_paths[wd] = path;
-        LOG(INFO) << "watch descriptor " << wd << " registered for " << path;
+        LOG(INFO) << "watch descriptor " << wd << " registered for '" << path << "'";
     }
 
     fdevent* event = fdevent_create(infd, adb_auth_inotify_update, nullptr);
@@ -420,8 +416,8 @@ static void adb_auth_inotify_init(const std::set<std::string>& paths) {
 void adb_auth_init() {
     LOG(INFO) << "adb_auth_init...";
 
-    if (!get_user_key()) {
-        LOG(ERROR) << "Failed to get user key";
+    if (!load_userkey()) {
+        LOG(ERROR) << "Failed to load (or generate) user key";
         return;
     }
 
@@ -432,7 +428,7 @@ void adb_auth_init() {
 #endif
 
     for (const std::string& path : key_paths) {
-        read_keys(path.c_str());
+        load_keys(path);
     }
 }
 
@@ -485,4 +481,79 @@ void send_auth_response(const char* token, size_t token_size, atransport* t) {
     p->payload.assign(result.begin(), result.end());
     p->msg.data_length = p->payload.size();
     send_packet(p, t);
+}
+
+void adb_auth_tls_handshake(atransport* t) {
+    std::thread([t]() {
+        std::shared_ptr<RSA> key = t->Key();
+        if (key == nullptr) {
+            // Can happen if !auth_required
+            LOG(INFO) << "t->auth_key not set before handshake";
+            key = t->NextKey();
+            CHECK(key);
+        }
+
+        LOG(INFO) << "Attempting to TLS handshake";
+        bool success = t->connection()->DoTlsHandshake(key.get());
+        if (success) {
+            LOG(INFO) << "Handshake succeeded. Waiting for CNXN packet...";
+        } else {
+            LOG(INFO) << "Handshake failed. Kicking transport";
+            t->Kick();
+        }
+    }).detach();
+}
+
+// Callback given to SSL_set_cert_cb to select a certificate when server requests
+// for a certificate. This is where the server will give us a CA-issuer list, and
+// figure out if the server knows any of our public keys. We currently always return
+// 1 here to indicate success, since we always try a key here (in the case of no auth).
+// See https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_set_cert_cb
+// for more details.
+int adb_tls_set_certificate(SSL* ssl) {
+    LOG(INFO) << __func__;
+
+    const STACK_OF(X509_NAME)* ca_list = SSL_get_client_CA_list(ssl);
+    if (ca_list == nullptr) {
+        // Either the device doesn't know any keys, or !auth_required.
+        // So let's just try with the default certificate and see what happens.
+        LOG(INFO) << "No client CA list. Trying with default certificate.";
+        return 1;
+    }
+
+    const size_t num_cas = sk_X509_NAME_num(ca_list);
+    for (size_t i = 0; i < num_cas; ++i) {
+        auto* x509_name = sk_X509_NAME_value(ca_list, i);
+        auto adbFingerprint = ParseEncodedKeyFromCAIssuer(x509_name);
+        if (!adbFingerprint.has_value()) {
+            // This could be a real CA issuer. Unfortunately, we don't support
+            // it ATM.
+            continue;
+        }
+
+        LOG(INFO) << "Checking for fingerprint match [" << *adbFingerprint << "]";
+        auto encoded_key = SHA256HexStringToBits(*adbFingerprint);
+        if (!encoded_key.has_value()) {
+            continue;
+        }
+        // Check against our list of encoded keys for a match
+        std::lock_guard<std::mutex> lock(g_keys_mutex);
+        auto rsa_priv_key = g_keys.find(*encoded_key);
+        if (rsa_priv_key != g_keys.end()) {
+            LOG(INFO) << "Got SHA256 match on a key";
+            bssl::UniquePtr<EVP_PKEY> evp_pkey(EVP_PKEY_new());
+            CHECK(EVP_PKEY_set1_RSA(evp_pkey.get(), rsa_priv_key->second.get()));
+            auto x509 = GenerateX509Certificate(evp_pkey.get());
+            auto x509_str = X509ToPEMString(x509.get());
+            auto evp_str = Key::ToPEMString(evp_pkey.get());
+            TlsConnection::SetCertAndKey(ssl, x509_str, evp_str);
+            return 1;
+        } else {
+            LOG(INFO) << "No match for [" << *adbFingerprint << "]";
+        }
+    }
+
+    // Let's just try with the default certificate anyways, because daemon might
+    // not require auth, even though it has a list of keys.
+    return 1;
 }

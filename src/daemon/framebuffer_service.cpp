@@ -32,7 +32,7 @@
 
 #include "adb.h"
 #include "adb_io.h"
-#include "fdevent.h"
+#include "adb_utils.h"
 
 /* TODO:
 ** - sync with vsync to avoid tearing
@@ -78,7 +78,7 @@ void framebuffer_service(unique_fd fd) {
         const char* command = "screencap";
         const char *args[2] = {command, nullptr};
         execvp(command, (char**)args);
-        exit(1);
+        perror_exit("exec screencap failed");
     }
 
     adb_close(fds[1]);

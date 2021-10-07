@@ -22,43 +22,64 @@
 
 #include <dirent.h>
 #include <errno.h>
-#include <linux/xattr.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
-#include <sys/xattr.h>
 #include <unistd.h>
 #include <utime.h>
 
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <variant>
+#include <vector>
+
 #include <android-base/file.h>
+#include <android-base/macros.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <private/android_filesystem_config.h>
+
+#include <adbd_fs.h>
+
+// Needed for __android_log_security_bswrite.
 #include <private/android_logger.h>
-#if !ADB_NON_ANDROID
+
+#if defined(__ANDROID__)
+#include <linux/capability.h>
 #include <selinux/android.h>
+#include <sys/xattr.h>
 #endif
 
 #include "adb.h"
 #include "adb_io.h"
 #include "adb_trace.h"
 #include "adb_utils.h"
+#include "compression_utils.h"
 #include "file_sync_protocol.h"
 #include "security_log_tags.h"
 #include "sysdeps/errno.h"
 
+using android::base::borrowed_fd;
+using android::base::Dirname;
+using android::base::Realpath;
 using android::base::StringPrintf;
 
-#if !ADB_NON_ANDROID
 static bool should_use_fs_config(const std::string& path) {
+#if defined(__ANDROID__)
     // TODO: use fs_config to configure permissions on /data too.
     return !android::base::StartsWith(path, "/data/");
-}
+#else
+    UNUSED(path);
+    return false;
 #endif
+}
 
 static bool update_capabilities(const char* path, uint64_t capabilities) {
+#if defined(__ANDROID__)
     if (capabilities == 0) {
         // Ensure we clean up in case the capabilities weren't 0 in the past.
         removexattr(path, XATTR_NAME_CAPS);
@@ -72,6 +93,10 @@ static bool update_capabilities(const char* path, uint64_t capabilities) {
     cap_data.data[1].permitted = (capabilities >> 32);
     cap_data.data[1].inheritable = 0;
     return setxattr(path, XATTR_NAME_CAPS, &cap_data, sizeof(cap_data), 0) != -1;
+#else
+    UNUSED(path, capabilities);
+    return true;
+#endif
 }
 
 static bool secure_mkdirs(const std::string& path) {
@@ -82,7 +107,7 @@ static bool secure_mkdirs(const std::string& path) {
     for (const auto& path_component : path_components) {
         uid_t uid = -1;
         gid_t gid = -1;
-        unsigned int mode = 0775;
+        mode_t mode = 0775;
         uint64_t capabilities = 0;
 
         if (path_component.empty()) {
@@ -93,11 +118,10 @@ static bool secure_mkdirs(const std::string& path) {
             partial_path += OS_PATH_SEPARATOR;
         }
         partial_path += path_component;
-#if !ADB_NON_ANDROID
+
         if (should_use_fs_config(partial_path)) {
-            fs_config(partial_path.c_str(), 1, nullptr, &uid, &gid, &mode, &capabilities);
+            adbd_fs_config(partial_path.c_str(), 1, nullptr, &uid, &gid, &mode, &capabilities);
         }
-#endif
         if (adb_mkdir(partial_path.c_str(), mode) == -1) {
             if (errno != EEXIST) {
                 return false;
@@ -105,7 +129,7 @@ static bool secure_mkdirs(const std::string& path) {
         } else {
             if (chown(partial_path.c_str(), uid, gid) == -1) return false;
 
-#if !ADB_NON_ANDROID
+#if defined(__ANDROID__)
             // Not all filesystems support setting SELinux labels. http://b/23530370.
             selinux_android_restorecon(partial_path.c_str(), 0);
 #endif
@@ -124,7 +148,7 @@ static bool do_lstat_v1(int s, const char* path) {
     lstat(path, &st);
     msg.stat_v1.mode = st.st_mode;
     msg.stat_v1.size = st.st_size;
-    msg.stat_v1.time = st.st_mtime;
+    msg.stat_v1.mtime = st.st_mtime;
     return WriteFdExactly(s, &msg.stat_v1, sizeof(msg.stat_v1));
 }
 
@@ -159,46 +183,79 @@ static bool do_stat_v2(int s, uint32_t id, const char* path) {
     return WriteFdExactly(s, &msg.stat_v2, sizeof(msg.stat_v2));
 }
 
+template <bool v2>
 static bool do_list(int s, const char* path) {
     dirent* de;
 
-    syncmsg msg;
-    msg.dent.id = ID_DENT;
+    using MessageType =
+            std::conditional_t<v2, decltype(syncmsg::dent_v2), decltype(syncmsg::dent_v1)>;
+    MessageType msg;
+    uint32_t msg_id;
+    if constexpr (v2) {
+        msg_id = ID_DENT_V2;
+    } else {
+        msg_id = ID_DENT_V1;
+    }
 
     std::unique_ptr<DIR, int(*)(DIR*)> d(opendir(path), closedir);
     if (!d) goto done;
 
     while ((de = readdir(d.get()))) {
+        memset(&msg, 0, sizeof(msg));
+        msg.id = msg_id;
+
         std::string filename(StringPrintf("%s/%s", path, de->d_name));
 
         struct stat st;
         if (lstat(filename.c_str(), &st) == 0) {
-            size_t d_name_length = strlen(de->d_name);
-            msg.dent.mode = st.st_mode;
-            msg.dent.size = st.st_size;
-            msg.dent.time = st.st_mtime;
-            msg.dent.namelen = d_name_length;
+            msg.mode = st.st_mode;
+            msg.size = st.st_size;
+            msg.mtime = st.st_mtime;
 
-            if (!WriteFdExactly(s, &msg.dent, sizeof(msg.dent)) ||
-                    !WriteFdExactly(s, de->d_name, d_name_length)) {
-                return false;
+            if constexpr (v2) {
+                msg.dev = st.st_dev;
+                msg.ino = st.st_ino;
+                msg.nlink = st.st_nlink;
+                msg.uid = st.st_uid;
+                msg.gid = st.st_gid;
+                msg.atime = st.st_atime;
+                msg.ctime = st.st_ctime;
             }
+        } else {
+            if constexpr (v2) {
+                msg.error = errno;
+            } else {
+                continue;
+            }
+        }
+
+        size_t d_name_length = strlen(de->d_name);
+        msg.namelen = d_name_length;
+
+        if (!WriteFdExactly(s, &msg, sizeof(msg)) ||
+            !WriteFdExactly(s, de->d_name, d_name_length)) {
+            return false;
         }
     }
 
 done:
-    msg.dent.id = ID_DONE;
-    msg.dent.mode = 0;
-    msg.dent.size = 0;
-    msg.dent.time = 0;
-    msg.dent.namelen = 0;
-    return WriteFdExactly(s, &msg.dent, sizeof(msg.dent));
+    memset(&msg, 0, sizeof(msg));
+    msg.id = ID_DONE;
+    return WriteFdExactly(s, &msg, sizeof(msg));
+}
+
+static bool do_list_v1(int s, const char* path) {
+    return do_list<false>(s, path);
+}
+
+static bool do_list_v2(int s, const char* path) {
+    return do_list<true>(s, path);
 }
 
 // Make sure that SendFail from adb_io.cpp isn't accidentally used in this file.
 #pragma GCC poison SendFail
 
-static bool SendSyncFail(int fd, const std::string& reason) {
+static bool SendSyncFail(borrowed_fd fd, const std::string& reason) {
     D("sync: failure: %s", reason.c_str());
 
     syncmsg msg;
@@ -207,90 +264,150 @@ static bool SendSyncFail(int fd, const std::string& reason) {
     return WriteFdExactly(fd, &msg.data, sizeof(msg.data)) && WriteFdExactly(fd, reason);
 }
 
-static bool SendSyncFailErrno(int fd, const std::string& reason) {
+static bool SendSyncFailErrno(borrowed_fd fd, const std::string& reason) {
     return SendSyncFail(fd, StringPrintf("%s: %s", reason.c_str(), strerror(errno)));
 }
 
-static bool handle_send_file(int s, const char* path, uid_t uid, gid_t gid, uint64_t capabilities,
-                             mode_t mode, std::vector<char>& buffer, bool do_unlink) {
+static bool handle_send_file_data(borrowed_fd s, unique_fd fd, uint32_t* timestamp,
+                                  CompressionType compression) {
     syncmsg msg;
-    unsigned int timestamp = 0;
+    Block buffer(SYNC_DATA_MAX);
+    std::span<char> buffer_span(buffer.data(), buffer.size());
+    std::variant<std::monostate, NullDecoder, BrotliDecoder, LZ4Decoder, ZstdDecoder>
+            decoder_storage;
+    Decoder* decoder = nullptr;
 
-    __android_log_security_bswrite(SEC_TAG_ADB_SEND_FILE, path);
+    switch (compression) {
+        case CompressionType::None:
+            decoder = &decoder_storage.emplace<NullDecoder>(buffer_span);
+            break;
 
-    int fd = adb_open_mode(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode);
+        case CompressionType::Brotli:
+            decoder = &decoder_storage.emplace<BrotliDecoder>(buffer_span);
+            break;
 
-    if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL | POSIX_FADV_NOREUSE | POSIX_FADV_WILLNEED) <
-        0) {
-        D("[ Failed to fadvise: %d ]", errno);
-    }
+        case CompressionType::LZ4:
+            decoder = &decoder_storage.emplace<LZ4Decoder>(buffer_span);
+            break;
 
-    if (fd < 0 && errno == ENOENT) {
-        if (!secure_mkdirs(android::base::Dirname(path))) {
-            SendSyncFailErrno(s, "secure_mkdirs failed");
-            goto fail;
-        }
-        fd = adb_open_mode(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode);
-    }
-    if (fd < 0 && errno == EEXIST) {
-        fd = adb_open_mode(path, O_WRONLY | O_CLOEXEC, mode);
-    }
-    if (fd < 0) {
-        SendSyncFailErrno(s, "couldn't create file");
-        goto fail;
-    } else {
-        if (fchown(fd, uid, gid) == -1) {
-            SendSyncFailErrno(s, "fchown failed");
-            goto fail;
-        }
+        case CompressionType::Zstd:
+            decoder = &decoder_storage.emplace<ZstdDecoder>(buffer_span);
+            break;
 
-#if !ADB_NON_ANDROID
-        // Not all filesystems support setting SELinux labels. http://b/23530370.
-        selinux_android_restorecon(path, 0);
-#endif
-
-        // fchown clears the setuid bit - restore it if present.
-        // Ignore the result of calling fchmod. It's not supported
-        // by all filesystems, so we don't check for success. b/12441485
-        fchmod(fd, mode);
+        case CompressionType::Any:
+            LOG(FATAL) << "unexpected CompressionType::Any";
     }
 
     while (true) {
-        if (!ReadFdExactly(s, &msg.data, sizeof(msg.data))) goto fail;
+        if (!ReadFdExactly(s, &msg.data, sizeof(msg.data))) return false;
 
-        if (msg.data.id != ID_DATA) {
-            if (msg.data.id == ID_DONE) {
-                timestamp = msg.data.size;
-                break;
-            }
+        if (msg.data.id == ID_DONE) {
+            *timestamp = msg.data.size;
+            decoder->Finish();
+        } else if (msg.data.id == ID_DATA) {
+            Block block(msg.data.size);
+            if (!ReadFdExactly(s, block.data(), msg.data.size)) return false;
+            decoder->Append(std::move(block));
+        } else {
             SendSyncFail(s, "invalid data message");
-            goto abort;
+            return false;
         }
 
-        if (msg.data.size > buffer.size()) {  // TODO: resize buffer?
-            SendSyncFail(s, "oversize data message");
-            goto abort;
-        }
+        while (true) {
+            std::span<char> output;
+            DecodeResult result = decoder->Decode(&output);
+            if (result == DecodeResult::Error) {
+                SendSyncFailErrno(s, "decompress failed");
+                return false;
+            }
 
-        if (!ReadFdExactly(s, &buffer[0], msg.data.size)) goto abort;
+            // fd is -1 if the client is pushing with --dry-run.
+            if (fd != -1) {
+                if (!WriteFdExactly(fd, output.data(), output.size())) {
+                    SendSyncFailErrno(s, "write failed");
+                    return false;
+                }
+            }
 
-        if (!WriteFdExactly(fd, &buffer[0], msg.data.size)) {
-            SendSyncFailErrno(s, "write failed");
-            goto fail;
+            if (result == DecodeResult::NeedInput) {
+                break;
+            } else if (result == DecodeResult::MoreOutput) {
+                continue;
+            } else if (result == DecodeResult::Done) {
+                return true;
+            } else {
+                LOG(FATAL) << "invalid DecodeResult: " << static_cast<int>(result);
+            }
         }
     }
 
-    adb_close(fd);
+    __builtin_unreachable();
+}
+
+static bool handle_send_file(borrowed_fd s, const char* path, uint32_t* timestamp, uid_t uid,
+                             gid_t gid, uint64_t capabilities, mode_t mode,
+                             CompressionType compression, bool dry_run, std::vector<char>& buffer,
+                             bool do_unlink) {
+    syncmsg msg;
+    unique_fd fd;
+
+    if (!dry_run) {
+        __android_log_security_bswrite(SEC_TAG_ADB_SEND_FILE, path);
+        fd.reset(adb_open_mode(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode));
+
+        if (fd < 0 && errno == ENOENT) {
+            if (!secure_mkdirs(Dirname(path))) {
+                SendSyncFailErrno(s, "secure_mkdirs failed");
+                goto fail;
+            }
+            fd.reset(adb_open_mode(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode));
+        }
+        if (fd < 0 && errno == EEXIST) {
+            fd.reset(adb_open_mode(path, O_WRONLY | O_CLOEXEC, mode));
+        }
+        if (fd < 0) {
+            SendSyncFailErrno(s, "couldn't create file");
+            goto fail;
+        } else {
+            if (fchown(fd.get(), uid, gid) == -1) {
+                struct stat st;
+                std::string real_path;
+
+                // Only return failure if parent directory does not have S_ISGID bit set,
+                // if S_ISGID is set then file will inherit groupid from directory
+                if (!Realpath(path, &real_path) || lstat(Dirname(real_path).c_str(), &st) == -1 ||
+                    (S_ISDIR(st.st_mode) && (st.st_mode & S_ISGID) == 0)) {
+                    SendSyncFailErrno(s, "fchown failed");
+                    goto fail;
+                }
+            }
+
+#if defined(__ANDROID__)
+            // Not all filesystems support setting SELinux labels. http://b/23530370.
+            selinux_android_restorecon(path, 0);
+#endif
+
+            // fchown clears the setuid bit - restore it if present.
+            // Ignore the result of calling fchmod. It's not supported
+            // by all filesystems, so we don't check for success. b/12441485
+            fchmod(fd.get(), mode);
+        }
+
+        int rc = posix_fadvise(fd.get(), 0, 0,
+                               POSIX_FADV_SEQUENTIAL | POSIX_FADV_NOREUSE | POSIX_FADV_WILLNEED);
+        if (rc != 0) {
+            D("[ Failed to fadvise: %s ]", strerror(rc));
+        }
+    }
+
+    if (!handle_send_file_data(s, std::move(fd), timestamp, compression)) {
+        goto fail;
+    }
 
     if (!update_capabilities(path, capabilities)) {
         SendSyncFailErrno(s, "update_capabilities failed");
         goto fail;
     }
-
-    utimbuf u;
-    u.actime = timestamp;
-    u.modtime = timestamp;
-    utime(path, &u);
 
     msg.status.id = ID_OKAY;
     msg.status.msglen = 0;
@@ -325,19 +442,18 @@ fail:
         if (!ReadFdExactly(s, &buffer[0], msg.data.size)) break;
     }
 
-abort:
-    if (fd >= 0) adb_close(fd);
     if (do_unlink) adb_unlink(path);
     return false;
 }
 
 #if defined(_WIN32)
-extern bool handle_send_link(int s, const std::string& path, std::vector<char>& buffer) __attribute__((error("no symlinks on Windows")));
+extern bool handle_send_link(int s, const std::string& path,
+                             uint32_t* timestamp, std::vector<char>& buffer)
+        __attribute__((error("no symlinks on Windows")));
 #else
-static bool handle_send_link(int s, const std::string& path, std::vector<char>& buffer) {
+static bool handle_send_link(int s, const std::string& path, uint32_t* timestamp, bool dry_run,
+                             std::vector<char>& buffer) {
     syncmsg msg;
-    unsigned int len;
-    int ret;
 
     if (!ReadFdExactly(s, &msg.data, sizeof(msg.data))) return false;
 
@@ -346,29 +462,36 @@ static bool handle_send_link(int s, const std::string& path, std::vector<char>& 
         return false;
     }
 
-    len = msg.data.size;
+    unsigned int len = msg.data.size;
     if (len > buffer.size()) { // TODO: resize buffer?
         SendSyncFail(s, "oversize data message");
         return false;
     }
     if (!ReadFdExactly(s, &buffer[0], len)) return false;
 
-    ret = symlink(&buffer[0], path.c_str());
-    if (ret && errno == ENOENT) {
-        if (!secure_mkdirs(android::base::Dirname(path))) {
-            SendSyncFailErrno(s, "secure_mkdirs failed");
-            return false;
+    std::string buf_link;
+    if (!dry_run) {
+        if (!android::base::Readlink(path, &buf_link) || (buf_link != &buffer[0])) {
+            adb_unlink(path.c_str());
+            auto ret = symlink(&buffer[0], path.c_str());
+            if (ret && errno == ENOENT) {
+                if (!secure_mkdirs(Dirname(path))) {
+                    SendSyncFailErrno(s, "secure_mkdirs failed");
+                    return false;
+                }
+                ret = symlink(&buffer[0], path.c_str());
+            }
+            if (ret) {
+                SendSyncFailErrno(s, "symlink failed");
+                return false;
+            }
         }
-        ret = symlink(&buffer[0], path.c_str());
-    }
-    if (ret) {
-        SendSyncFailErrno(s, "symlink failed");
-        return false;
     }
 
     if (!ReadFdExactly(s, &msg.data, sizeof(msg.data))) return false;
 
     if (msg.data.id == ID_DONE) {
+        *timestamp = msg.data.size;
         msg.status.id = ID_OKAY;
         msg.status.msglen = 0;
         if (!WriteFdExactly(s, &msg.status, sizeof(msg.status))) return false;
@@ -381,11 +504,58 @@ static bool handle_send_link(int s, const std::string& path, std::vector<char>& 
 }
 #endif
 
-static bool do_send(int s, const std::string& spec, std::vector<char>& buffer) {
+static bool send_impl(int s, const std::string& path, mode_t mode, CompressionType compression,
+                      bool dry_run, std::vector<char>& buffer) {
+    // Don't delete files before copying if they are not "regular" or symlinks.
+    struct stat st;
+    bool do_unlink = false;
+    if (!dry_run) {
+        do_unlink = (lstat(path.c_str(), &st) == -1) || S_ISREG(st.st_mode) ||
+                    (S_ISLNK(st.st_mode) && !S_ISLNK(mode));
+    }
+    if (do_unlink) {
+        adb_unlink(path.c_str());
+    }
+
+    bool result;
+    uint32_t timestamp;
+    if (S_ISLNK(mode)) {
+        result = handle_send_link(s, path, &timestamp, dry_run, buffer);
+    } else {
+        // Copy user permission bits to "group" and "other" permissions.
+        mode &= 0777;
+        mode |= ((mode >> 3) & 0070);
+        mode |= ((mode >> 3) & 0007);
+
+        uid_t uid = -1;
+        gid_t gid = -1;
+        uint64_t capabilities = 0;
+        if (should_use_fs_config(path) && !dry_run) {
+            adbd_fs_config(path.c_str(), 0, nullptr, &uid, &gid, &mode, &capabilities);
+        }
+
+        result = handle_send_file(s, path.c_str(), &timestamp, uid, gid, capabilities, mode,
+                                  compression, dry_run, buffer, do_unlink);
+    }
+
+    if (!result) {
+      return false;
+    }
+
+    struct timeval tv[2];
+    tv[0].tv_sec = timestamp;
+    tv[0].tv_usec = 0;
+    tv[1].tv_sec = timestamp;
+    tv[1].tv_usec = 0;
+    lutimes(path.c_str(), tv);
+    return true;
+}
+
+static bool do_send_v1(int s, const std::string& spec, std::vector<char>& buffer) {
     // 'spec' is of the form "/some/path,0755". Break it up.
     size_t comma = spec.find_last_of(',');
     if (comma == std::string::npos) {
-        SendSyncFail(s, "missing , in ID_SEND");
+        SendSyncFail(s, "missing , in ID_SEND_V1");
         return false;
     }
 
@@ -398,70 +568,208 @@ static bool do_send(int s, const std::string& spec, std::vector<char>& buffer) {
         return false;
     }
 
-    // Don't delete files before copying if they are not "regular" or symlinks.
-    struct stat st;
-    bool do_unlink = (lstat(path.c_str(), &st) == -1) || S_ISREG(st.st_mode) || S_ISLNK(st.st_mode);
-    if (do_unlink) {
-        adb_unlink(path.c_str());
-    }
-
-    if (S_ISLNK(mode)) {
-        return handle_send_link(s, path.c_str(), buffer);
-    }
-
-    // Copy user permission bits to "group" and "other" permissions.
-    mode &= 0777;
-    mode |= ((mode >> 3) & 0070);
-    mode |= ((mode >> 3) & 0007);
-
-    uid_t uid = -1;
-    gid_t gid = -1;
-    uint64_t capabilities = 0;
-#if !ADB_NON_ANDROID
-    if (should_use_fs_config(path)) {
-        unsigned int broken_api_hack = mode;
-        fs_config(path.c_str(), 0, nullptr, &uid, &gid, &broken_api_hack, &capabilities);
-        mode = broken_api_hack;
-    }
-#endif
-    return handle_send_file(s, path.c_str(), uid, gid, capabilities, mode, buffer, do_unlink);
+    return send_impl(s, path, mode, CompressionType::None, false, buffer);
 }
 
-static bool do_recv(int s, const char* path, std::vector<char>& buffer) {
+static bool do_send_v2(int s, const std::string& path, std::vector<char>& buffer) {
+    // Read the setup packet.
+    syncmsg msg;
+    int rc = ReadFdExactly(s, &msg.send_v2_setup, sizeof(msg.send_v2_setup));
+    if (rc == 0) {
+        LOG(ERROR) << "failed to read send_v2 setup packet: EOF";
+        return false;
+    } else if (rc < 0) {
+        PLOG(ERROR) << "failed to read send_v2 setup packet";
+    }
+
+    bool dry_run = false;
+    std::optional<CompressionType> compression;
+
+    uint32_t orig_flags = msg.send_v2_setup.flags;
+    if (msg.send_v2_setup.flags & kSyncFlagBrotli) {
+        msg.send_v2_setup.flags &= ~kSyncFlagBrotli;
+        if (compression) {
+            SendSyncFail(s, android::base::StringPrintf("multiple compression flags received: %d",
+                                                        orig_flags));
+            return false;
+        }
+        compression = CompressionType::Brotli;
+    }
+    if (msg.send_v2_setup.flags & kSyncFlagLZ4) {
+        msg.send_v2_setup.flags &= ~kSyncFlagLZ4;
+        if (compression) {
+            SendSyncFail(s, android::base::StringPrintf("multiple compression flags received: %d",
+                                                        orig_flags));
+            return false;
+        }
+        compression = CompressionType::LZ4;
+    }
+    if (msg.send_v2_setup.flags & kSyncFlagZstd) {
+        msg.send_v2_setup.flags &= ~kSyncFlagZstd;
+        if (compression) {
+            SendSyncFail(s, android::base::StringPrintf("multiple compression flags received: %d",
+                                                        orig_flags));
+            return false;
+        }
+        compression = CompressionType::Zstd;
+    }
+    if (msg.send_v2_setup.flags & kSyncFlagDryRun) {
+        msg.send_v2_setup.flags &= ~kSyncFlagDryRun;
+        dry_run = true;
+    }
+
+    if (msg.send_v2_setup.flags) {
+        SendSyncFail(s, android::base::StringPrintf("unknown flags: %d", msg.send_v2_setup.flags));
+        return false;
+    }
+
+    errno = 0;
+    return send_impl(s, path, msg.send_v2_setup.mode, compression.value_or(CompressionType::None),
+                     dry_run, buffer);
+}
+
+static bool recv_impl(borrowed_fd s, const char* path, CompressionType compression,
+                      std::vector<char>& buffer) {
     __android_log_security_bswrite(SEC_TAG_ADB_RECV_FILE, path);
 
-    int fd = adb_open(path, O_RDONLY | O_CLOEXEC);
+    unique_fd fd(adb_open(path, O_RDONLY | O_CLOEXEC));
     if (fd < 0) {
         SendSyncFailErrno(s, "open failed");
         return false;
     }
 
-    if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL | POSIX_FADV_NOREUSE) < 0) {
-        D("[ Failed to fadvise: %d ]", errno);
+    int rc = posix_fadvise(fd.get(), 0, 0, POSIX_FADV_SEQUENTIAL | POSIX_FADV_NOREUSE);
+    if (rc != 0) {
+        D("[ Failed to fadvise: %s ]", strerror(rc));
     }
 
     syncmsg msg;
     msg.data.id = ID_DATA;
-    while (true) {
-        int r = adb_read(fd, &buffer[0], buffer.size() - sizeof(msg.data));
-        if (r <= 0) {
-            if (r == 0) break;
-            SendSyncFailErrno(s, "read failed");
-            adb_close(fd);
-            return false;
-        }
-        msg.data.size = r;
-        if (!WriteFdExactly(s, &msg.data, sizeof(msg.data)) || !WriteFdExactly(s, &buffer[0], r)) {
-            adb_close(fd);
-            return false;
-        }
+
+    std::variant<std::monostate, NullEncoder, BrotliEncoder, LZ4Encoder, ZstdEncoder>
+            encoder_storage;
+    Encoder* encoder;
+
+    switch (compression) {
+        case CompressionType::None:
+            encoder = &encoder_storage.emplace<NullEncoder>(SYNC_DATA_MAX);
+            break;
+
+        case CompressionType::Brotli:
+            encoder = &encoder_storage.emplace<BrotliEncoder>(SYNC_DATA_MAX);
+            break;
+
+        case CompressionType::LZ4:
+            encoder = &encoder_storage.emplace<LZ4Encoder>(SYNC_DATA_MAX);
+            break;
+
+        case CompressionType::Zstd:
+            encoder = &encoder_storage.emplace<ZstdEncoder>(SYNC_DATA_MAX);
+            break;
+
+        case CompressionType::Any:
+            LOG(FATAL) << "unexpected CompressionType::Any";
     }
 
-    adb_close(fd);
+    bool sending = true;
+    while (sending) {
+        Block input(SYNC_DATA_MAX);
+        int r = adb_read(fd.get(), input.data(), input.size());
+        if (r < 0) {
+            SendSyncFailErrno(s, "read failed");
+            return false;
+        }
+
+        if (r == 0) {
+            encoder->Finish();
+        } else {
+            input.resize(r);
+            encoder->Append(std::move(input));
+        }
+
+        while (true) {
+            Block output;
+            EncodeResult result = encoder->Encode(&output);
+            if (result == EncodeResult::Error) {
+                SendSyncFailErrno(s, "compress failed");
+                return false;
+            }
+
+            if (!output.empty()) {
+                msg.data.size = output.size();
+                if (!WriteFdExactly(s, &msg.data, sizeof(msg.data)) ||
+                    !WriteFdExactly(s, output.data(), output.size())) {
+                    return false;
+                }
+            }
+
+            if (result == EncodeResult::Done) {
+                sending = false;
+                break;
+            } else if (result == EncodeResult::NeedInput) {
+                break;
+            } else if (result == EncodeResult::MoreOutput) {
+                continue;
+            }
+        }
+    }
 
     msg.data.id = ID_DONE;
     msg.data.size = 0;
     return WriteFdExactly(s, &msg.data, sizeof(msg.data));
+}
+
+static bool do_recv_v1(borrowed_fd s, const char* path, std::vector<char>& buffer) {
+    return recv_impl(s, path, CompressionType::None, buffer);
+}
+
+static bool do_recv_v2(borrowed_fd s, const char* path, std::vector<char>& buffer) {
+    syncmsg msg;
+    // Read the setup packet.
+    int rc = ReadFdExactly(s, &msg.recv_v2_setup, sizeof(msg.recv_v2_setup));
+    if (rc == 0) {
+        LOG(ERROR) << "failed to read recv_v2 setup packet: EOF";
+        return false;
+    } else if (rc < 0) {
+        PLOG(ERROR) << "failed to read recv_v2 setup packet";
+    }
+
+    std::optional<CompressionType> compression;
+    uint32_t orig_flags = msg.recv_v2_setup.flags;
+    if (msg.recv_v2_setup.flags & kSyncFlagBrotli) {
+        msg.recv_v2_setup.flags &= ~kSyncFlagBrotli;
+        if (compression) {
+            SendSyncFail(s, android::base::StringPrintf("multiple compression flags received: %d",
+                                                        orig_flags));
+            return false;
+        }
+        compression = CompressionType::Brotli;
+    }
+    if (msg.recv_v2_setup.flags & kSyncFlagLZ4) {
+        msg.recv_v2_setup.flags &= ~kSyncFlagLZ4;
+        if (compression) {
+            SendSyncFail(s, android::base::StringPrintf("multiple compression flags received: %d",
+                                                        orig_flags));
+            return false;
+        }
+        compression = CompressionType::LZ4;
+    }
+    if (msg.recv_v2_setup.flags & kSyncFlagZstd) {
+        msg.recv_v2_setup.flags &= ~kSyncFlagZstd;
+        if (compression) {
+            SendSyncFail(s, android::base::StringPrintf("multiple compression flags received: %d",
+                                                        orig_flags));
+            return false;
+        }
+        compression = CompressionType::Zstd;
+    }
+
+    if (msg.recv_v2_setup.flags) {
+        SendSyncFail(s, android::base::StringPrintf("unknown flags: %d", msg.recv_v2_setup.flags));
+        return false;
+    }
+
+    return recv_impl(s, path, compression.value_or(CompressionType::None), buffer);
 }
 
 static const char* sync_id_to_name(uint32_t id) {
@@ -472,12 +780,18 @@ static const char* sync_id_to_name(uint32_t id) {
       return "lstat_v2";
     case ID_STAT_V2:
       return "stat_v2";
-    case ID_LIST:
-      return "list";
-    case ID_SEND:
-      return "send";
-    case ID_RECV:
-      return "recv";
+    case ID_LIST_V1:
+      return "list_v1";
+    case ID_LIST_V2:
+      return "list_v2";
+    case ID_SEND_V1:
+        return "send_v1";
+    case ID_SEND_V2:
+        return "send_v2";
+    case ID_RECV_V1:
+        return "recv_v1";
+    case ID_RECV_V2:
+        return "recv_v2";
     case ID_QUIT:
         return "quit";
     default:
@@ -488,7 +802,6 @@ static const char* sync_id_to_name(uint32_t id) {
 static bool handle_sync_command(int fd, std::vector<char>& buffer) {
     D("sync: waiting for request");
 
-    ATRACE_CALL();
     SyncRequest request;
     if (!ReadFdExactly(fd, &request, sizeof(request))) {
         SendSyncFail(fd, "command read failure");
@@ -507,8 +820,6 @@ static bool handle_sync_command(int fd, std::vector<char>& buffer) {
     name[path_length] = 0;
 
     std::string id_name = sync_id_to_name(request.id);
-    std::string trace_name = StringPrintf("%s(%s)", id_name.c_str(), name);
-    ATRACE_NAME(trace_name.c_str());
 
     D("sync: %s('%s')", id_name.c_str(), name);
     switch (request.id) {
@@ -519,14 +830,23 @@ static bool handle_sync_command(int fd, std::vector<char>& buffer) {
         case ID_STAT_V2:
             if (!do_stat_v2(fd, request.id, name)) return false;
             break;
-        case ID_LIST:
-            if (!do_list(fd, name)) return false;
+        case ID_LIST_V1:
+            if (!do_list_v1(fd, name)) return false;
             break;
-        case ID_SEND:
-            if (!do_send(fd, name, buffer)) return false;
+        case ID_LIST_V2:
+            if (!do_list_v2(fd, name)) return false;
             break;
-        case ID_RECV:
-            if (!do_recv(fd, name, buffer)) return false;
+        case ID_SEND_V1:
+            if (!do_send_v1(fd, name, buffer)) return false;
+            break;
+        case ID_SEND_V2:
+            if (!do_send_v2(fd, name, buffer)) return false;
+            break;
+        case ID_RECV_V1:
+            if (!do_recv_v1(fd, name, buffer)) return false;
+            break;
+        case ID_RECV_V2:
+            if (!do_recv_v2(fd, name, buffer)) return false;
             break;
         case ID_QUIT:
             return false;

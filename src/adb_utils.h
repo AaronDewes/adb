@@ -14,17 +14,20 @@
  * limitations under the License.
  */
 
-#ifndef _ADB_UTILS_H_
-#define _ADB_UTILS_H_
+#pragma once
 
+#include <charconv>
 #include <condition_variable>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include <android-base/macros.h>
 
-int syntax_error(const char*, ...) __attribute__((__format__(__printf__, 1, 2)));
+#include "adb.h"
+#include "adb_unique_fd.h"
 
 void close_stdin();
 
@@ -42,14 +45,17 @@ bool mkdirs(const std::string& path);
 std::string escape_arg(const std::string& s);
 
 std::string dump_hex(const void* ptr, size_t byte_count);
+std::string dump_header(const amessage* msg);
+std::string dump_packet(const char* name, const char* func, const apacket* p);
 
 std::string perror_str(const char* msg);
 
-bool set_file_block_mode(int fd, bool block);
+[[noreturn]] void error_exit(const char* fmt, ...) __attribute__((__format__(__printf__, 1, 2)));
+[[noreturn]] void perror_exit(const char* fmt, ...) __attribute__((__format__(__printf__, 1, 2)));
 
-extern int adb_close(int fd);
+bool set_file_block_mode(borrowed_fd fd, bool block);
 
-// Given forward/reverse targets, returns true if they look sane. If an error is found, fills
+// Given forward/reverse targets, returns true if they look valid. If an error is found, fills
 // |error| and returns false.
 // Currently this only checks "tcp:" targets. Additional checking could be added for other targets
 // if needed.
@@ -91,4 +97,33 @@ class BlockingQueue {
 
 std::string GetLogFilePath();
 
-#endif
+inline std::string_view StripTrailingNulls(std::string_view str) {
+    size_t n = 0;
+    for (auto it = str.rbegin(); it != str.rend(); ++it) {
+        if (*it != '\0') {
+            break;
+        }
+        ++n;
+    }
+
+    str.remove_suffix(n);
+    return str;
+}
+
+// Base-10 stroll on a string_view.
+template <typename T>
+inline bool ParseUint(T* result, std::string_view str, std::string_view* remaining = nullptr) {
+    T value;
+    const auto res = std::from_chars(str.begin(), str.end(), value);
+    if (res.ec != std::errc{}) {
+        return false;
+    }
+    if (res.ptr != str.end() && !remaining) {
+        return false;
+    }
+    if (remaining) {
+        *remaining = std::string_view(res.ptr, str.end() - res.ptr);
+    }
+    *result = value;
+    return true;
+}

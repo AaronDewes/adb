@@ -35,8 +35,7 @@ static void appendBuffer(std::vector<char>* buffer, const char* input, int lengt
 
 class DeployAgentBufferCallback : public StandardStreamsCallbackInterface {
   public:
-    DeployAgentBufferCallback(std::vector<char>* outBuffer, std::vector<char>* errBuffer,
-                              int* statusCode);
+    DeployAgentBufferCallback(std::vector<char>* outBuffer, std::vector<char>* errBuffer);
 
     virtual void OnStdout(const char* buffer, int length);
     virtual void OnStderr(const char* buffer, int length);
@@ -45,61 +44,18 @@ class DeployAgentBufferCallback : public StandardStreamsCallbackInterface {
   private:
     std::vector<char>* mpOutBuffer;
     std::vector<char>* mpErrBuffer;
-    int* mpStatusCode;
 };
 
 int capture_shell_command(const char* command, std::vector<char>* outBuffer,
                           std::vector<char>* errBuffer) {
-    int statusCode;
-    DeployAgentBufferCallback cb(outBuffer, errBuffer, &statusCode);
-    int ret = send_shell_command(command, false, &cb);
-
-    if (ret == 0) {
-        return statusCode;
-    } else {
-        return ret;
-    }
-}
-
-DeployAgentFileCallback::DeployAgentFileCallback(FILE* outputFile, std::vector<char>* errBuffer,
-                                                 int* statusCode) {
-    mpOutFile = outputFile;
-    mpErrBuffer = errBuffer;
-    mpStatusCode = statusCode;
-    mBytesWritten = 0;
-}
-
-void DeployAgentFileCallback::OnStdout(const char* buffer, int length) {
-    if (mpOutFile != NULL) {
-        int bytes_written = fwrite(buffer, 1, length, mpOutFile);
-        if (bytes_written != length) {
-            printf("Write error %d\n", bytes_written);
-        }
-        mBytesWritten += bytes_written;
-    }
-}
-
-void DeployAgentFileCallback::OnStderr(const char* buffer, int length) {
-    appendBuffer(mpErrBuffer, buffer, length);
-}
-
-int DeployAgentFileCallback::Done(int status) {
-    if (mpStatusCode != NULL) {
-        *mpStatusCode = status;
-    }
-    return 0;
-}
-
-int DeployAgentFileCallback::getBytesWritten() {
-    return mBytesWritten;
+    DeployAgentBufferCallback cb(outBuffer, errBuffer);
+    return send_shell_command(command, /*disable_shell_protocol=*/false, &cb);
 }
 
 DeployAgentBufferCallback::DeployAgentBufferCallback(std::vector<char>* outBuffer,
-                                                     std::vector<char>* errBuffer,
-                                                     int* statusCode) {
+                                                     std::vector<char>* errBuffer) {
     mpOutBuffer = outBuffer;
     mpErrBuffer = errBuffer;
-    mpStatusCode = statusCode;
 }
 
 void DeployAgentBufferCallback::OnStdout(const char* buffer, int length) {
@@ -111,8 +67,5 @@ void DeployAgentBufferCallback::OnStderr(const char* buffer, int length) {
 }
 
 int DeployAgentBufferCallback::Done(int status) {
-    if (mpStatusCode != NULL) {
-        *mpStatusCode = status;
-    }
-    return 0;
+    return status;
 }

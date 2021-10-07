@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -28,7 +29,6 @@
 #include "adb_unique_fd.h"
 #include "adb_utils.h"
 #include "sysdeps.h"
-#include "sysdeps/memory.h"
 #include "transport.h"
 #include "types.h"
 
@@ -85,25 +85,16 @@ struct NonblockingFdConnection : public Connection {
             if (pfds[0].revents) {
                 if ((pfds[0].revents & POLLOUT)) {
                     std::lock_guard<std::mutex> lock(this->write_mutex_);
-                    WriteResult result = DispatchWrites();
-                    switch (result) {
-                        case WriteResult::Error:
-                            *error = "write failed";
-                            return;
-
-                        case WriteResult::Completed:
-                            writable_ = true;
-                            break;
-
-                        case WriteResult::TryAgain:
-                            break;
+                    if (DispatchWrites() == WriteResult::Error) {
+                        *error = "write failed";
+                        return;
                     }
                 }
 
                 if (pfds[0].revents & POLLIN) {
                     // TODO: Should we be getting blocks from a free list?
-                    auto block = std::make_unique<IOVector::block_type>(MAX_PAYLOAD);
-                    rc = adb_read(fd_.get(), &(*block)[0], block->size());
+                    auto block = IOVector::block_type(MAX_PAYLOAD);
+                    rc = adb_read(fd_.get(), &block[0], block.size());
                     if (rc == -1) {
                         *error = std::string("read failed: ") + strerror(errno);
                         return;
@@ -111,7 +102,7 @@ struct NonblockingFdConnection : public Connection {
                         *error = "read failed: EOF";
                         return;
                     }
-                    block->resize(rc);
+                    block.resize(rc);
                     read_buffer_.append(std::move(block));
 
                     if (!read_header_ && read_buffer_.size() >= sizeof(amessage)) {
@@ -125,12 +116,12 @@ struct NonblockingFdConnection : public Connection {
                         auto data_chain = read_buffer_.take_front(read_header_->data_length);
 
                         // TODO: Make apacket carry around a IOVector instead of coalescing.
-                        auto payload = data_chain.coalesce<apacket::payload_type>();
+                        auto payload = std::move(data_chain).coalesce();
                         auto packet = std::make_unique<apacket>();
                         packet->msg = *read_header_;
                         packet->payload = std::move(payload);
                         read_header_ = nullptr;
-                        read_callback_(this, std::move(packet));
+                        transport_->HandleRead(std::move(packet));
                     }
                 }
             }
@@ -154,7 +145,7 @@ struct NonblockingFdConnection : public Connection {
         thread_ = std::thread([this]() {
             std::string error = "connection closed";
             Run(&error);
-            this->error_callback_(this, error);
+            transport_->HandleError(error);
         });
     }
 
@@ -162,6 +153,11 @@ struct NonblockingFdConnection : public Connection {
         SetRunning(false);
         WakeThread();
         thread_.join();
+    }
+
+    bool DoTlsHandshake(RSA* key, std::string* auth_key) override final {
+        LOG(FATAL) << "Not supported yet";
+        return false;
     }
 
     void WakeThread() {
@@ -179,21 +175,22 @@ struct NonblockingFdConnection : public Connection {
 
     WriteResult DispatchWrites() REQUIRES(write_mutex_) {
         CHECK(!write_buffer_.empty());
-        if (!writable_) {
-            return WriteResult::TryAgain;
-        }
-
         auto iovs = write_buffer_.iovecs();
         ssize_t rc = adb_writev(fd_.get(), iovs.data(), iovs.size());
         if (rc == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                writable_ = false;
+                return WriteResult::TryAgain;
+            }
+
             return WriteResult::Error;
         } else if (rc == 0) {
             errno = 0;
             return WriteResult::Error;
         }
 
-        // TODO: Implement a more efficient drop_front?
-        write_buffer_.take_front(rc);
+        write_buffer_.drop_front(rc);
+        writable_ = write_buffer_.empty();
         if (write_buffer_.empty()) {
             return WriteResult::Completed;
         }
@@ -206,12 +203,17 @@ struct NonblockingFdConnection : public Connection {
         std::lock_guard<std::mutex> lock(write_mutex_);
         const char* header_begin = reinterpret_cast<const char*>(&packet->msg);
         const char* header_end = header_begin + sizeof(packet->msg);
-        auto header_block = std::make_unique<IOVector::block_type>(header_begin, header_end);
+        auto header_block = IOVector::block_type(header_begin, header_end);
         write_buffer_.append(std::move(header_block));
         if (!packet->payload.empty()) {
-            write_buffer_.append(std::make_unique<IOVector::block_type>(std::move(packet->payload)));
+            write_buffer_.append(std::move(packet->payload));
         }
-        return DispatchWrites() != WriteResult::Error;
+
+        WriteResult result = DispatchWrites();
+        if (result == WriteResult::TryAgain) {
+            WakeThread();
+        }
+        return result != WriteResult::Error;
     }
 
     std::thread thread_;
